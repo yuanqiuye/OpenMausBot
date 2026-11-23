@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -5,6 +6,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
   buildSigningEntitlements,
   extractPlistEntitlements,
+  injectMachOLoadDylib,
   patchExtractedAppBundle,
   plistToJson,
   validateProvisionEntitlements,
@@ -74,6 +76,7 @@ describe.runIf(process.platform === "darwin")("resign-ipa-apns bundle patcher", 
     expect(mainInfo.ExpoWidgets_EnablePushNotifications).toBe(true);
     expect(mainInfo.NSSupportsLiveActivities).toBe(true);
     expect(mainInfo.NSSupportsLiveActivitiesFrequentUpdates).toBe(true);
+    expect(mainInfo.NSUserActivityTypes).toEqual(["INSendMessageIntent"]);
     expect(mainInfo.UIBackgroundModes).toEqual(["audio", "remote-notification"]);
 
     const appConfig = JSON.parse(readFileSync(join(appDir, "EXConstants.bundle", "app.config"), "utf8"));
@@ -188,6 +191,18 @@ describe.runIf(process.platform === "darwin")("resign-ipa-apns bundle patcher", 
     });
     expect(JSON.stringify(mainSigned)).not.toContain("*");
 
+    const commSigned = buildSigningEntitlements({
+      ...profileEntitlements,
+      "com.apple.developer.usernotifications.communication": true,
+    }, {
+      teamId: "AB12CD34EF",
+      bundleId: "com.example.mausbot",
+      appGroup: "group.com.example.mausbot",
+      expectedAps: "development",
+      includeKeychainGroups: true,
+    });
+    expect(commSigned["com.apple.developer.usernotifications.communication"]).toBe(true);
+
     const widgetsSigned = buildSigningEntitlements(profileEntitlements, {
       teamId: "AB12CD34EF",
       bundleId: "com.example.mausbot.widgets",
@@ -233,5 +248,27 @@ describe.runIf(process.platform === "darwin")("resign-ipa-apns bundle patcher", 
     expect(() => extractPlistEntitlements(missingPath, "broken.mobileprovision")).toThrow(
       /No Entitlements dictionary found in provisioning profile: broken\.mobileprovision/,
     );
+  });
+
+  it("injects an idempotent LC_LOAD_WEAK_DYLIB load command into a 64-bit arm64 Mach-O binary", () => {
+    const root = mkdtempSync(join(tmpdir(), "omb-macho-inject-test-"));
+    tempDirs.push(root);
+    const src = join(root, "stub.c");
+    const bin = join(root, "StubApp");
+    writeFileSync(src, "int main(void) { return 0; }\n", "utf8");
+    execFileSync("/usr/bin/clang", [
+      "-arch", "arm64",
+      "-Wl,-headerpad,0x400",
+      src,
+      "-o", bin,
+    ]);
+
+    const first = injectMachOLoadDylib(bin, "@executable_path/Frameworks/OmbNotificationAvatar.dylib");
+    expect(first.injected).toBe(true);
+    const second = injectMachOLoadDylib(bin, "@executable_path/Frameworks/OmbNotificationAvatar.dylib");
+    expect(second).toEqual({ injected: false, reason: "already-present" });
+
+    const otoolOut = execFileSync("/usr/bin/otool", ["-L", bin], { encoding: "utf8" });
+    expect(otoolOut).toContain("@executable_path/Frameworks/OmbNotificationAvatar.dylib");
   });
 });

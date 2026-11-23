@@ -1,6 +1,7 @@
 import type { Notification } from "../../shared/notification";
 import { plainPreviewText } from "../../shared/plain-preview";
 import { finishedNotificationsEnabled, notificationSoundsEnabled } from "./notification-preferences";
+import { botNotificationIcon, type NotificationIconBot } from "./notify-icon";
 
 export type NotifyFrame = Notification;
 
@@ -22,19 +23,18 @@ export async function requestNotificationPermission(): Promise<NotificationPermi
   }
 }
 
-export interface NotificationBotIdentity {
-  id: string;
-  avatarUrl?: string | null;
+export interface NotificationBotIdentity extends NotificationIconBot {
+  name?: string | null;
 }
 
-export function buildNotificationOptions(bot: NotificationBotIdentity): NotificationOptions {
-  return { tag: `openmausbot:${bot.id}`, icon: bot.avatarUrl ?? undefined };
+export function buildNotificationOptions(bot: NotificationBotIdentity, kind?: string): NotificationOptions {
+  return { tag: `openmausbot:${bot.id}`, icon: botNotificationIcon(bot, kind) };
 }
 
 export function showNotification(
   frame: NotifyFrame,
   onOpen: (target: NotificationTarget) => void,
-  avatarUrl?: string | null,
+  botOrAvatarUrl?: NotificationBotIdentity | string | null,
   visibleThreadId?: string | null,
 ) {
   if (typeof Notification === "undefined") return;
@@ -43,12 +43,16 @@ export function showNotification(
   if (!spend && document.hasFocus() && visibleThreadId === frame.threadId) return;
   if (Notification.permission !== "granted") return;
 
-  const title = placeName ? `${placeName} · ${frame.title}` : frame.title;
+  const bot: NotificationBotIdentity = typeof botOrAvatarUrl === "object" && botOrAvatarUrl !== null
+    ? botOrAvatarUrl
+    : { id: frame.botId, avatarUrl: botOrAvatarUrl };
+  const baseTitle = !spend && bot.name && !frame.title.includes(bot.name) ? `${bot.name} · ${frame.title}` : frame.title;
+  const title = placeName ? `${placeName} · ${baseTitle}` : baseTitle;
   // Entries saved before the harness spoke plain text still carry Markdown.
   const body = plainPreviewText(frame.body);
   const options: NotificationOptions = {
     body,
-    ...buildNotificationOptions({ id: frame.botId, avatarUrl }),
+    ...buildNotificationOptions(bot, frame.kind),
     ...(spend ? { tag: "openmausbot:spend", icon: undefined } : {}),
     ...(notificationSoundsEnabled() ? {} : { silent: true }),
   };

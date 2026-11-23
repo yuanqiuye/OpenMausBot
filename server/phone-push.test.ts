@@ -585,6 +585,7 @@ describe("local direct APNs mode", () => {
       live: () => false,
       room: () => undefined,
       threadTitle: (threadId) => (threadId === "th_deploy" ? "Deploy iOS build" : undefined),
+      bot: (botId) => (botId === "bot_1" ? { color: "orange", mascotBody: "blob" } : undefined),
       fetchImpl: relay.fetchImpl,
       now: () => clock,
       log: () => {},
@@ -616,6 +617,14 @@ describe("local direct APNs mode", () => {
     expect(richPayload.aps.alert.body).toContain("xcodebuild failed");
     expect(richPayload.aps.alert.body).not.toContain("sk-proj-1234567890");
     expect(richPayload.aps["interruption-level"]).toBe("time-sensitive");
+    expect(richPayload.aps["mutable-content"]).toBe(1);
+    expect(richPayload.omb.botVisual).toEqual({
+      color: "#E78531",
+      gradient: ["#F4C8A2", "#E78531", "#864D1C"],
+      body: "blob",
+      faceInk: "#FFFFFF",
+      mood: "needsYou",
+    });
 
     includePreview = false;
     clock += 20_000;

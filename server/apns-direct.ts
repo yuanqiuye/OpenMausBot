@@ -1,5 +1,6 @@
 import { createHash, createPrivateKey, sign } from "node:crypto";
 import * as http2 from "node:http2";
+import { notificationMoodForKind, type BotNotificationVisual } from "../shared/bot-notification-visual.ts";
 import type { ActivityKind, PushRelayActivityRequest, PushRelaySendRequest } from "../shared/phone-push.ts";
 import type { ApnsEnvironment, ResolvedApnsConfig } from "./apns-config.ts";
 
@@ -34,6 +35,7 @@ const CATEGORY_UPDATE = "OPENMAUS_UPDATE";
 export interface DirectApnsSendRequest extends PushRelaySendRequest {
   alertSubtitle?: string;
   alertBody?: string;
+  botVisual?: BotNotificationVisual;
 }
 
 export interface DirectApnsActivityAnswer {
@@ -101,17 +103,30 @@ export function pushCategory(kind: string): string {
   return CATEGORY[kind] ?? CATEGORY_UPDATE;
 }
 
-function ombPayload(request: PushRelaySendRequest) {
+function ombPayload(request: DirectApnsSendRequest) {
   const { notification } = request;
+  const botVisual = request.botVisual
+    ? { ...request.botVisual, mood: request.botVisual.mood ?? notificationMoodForKind(notification.kind) }
+    : undefined;
   return {
     v: 1,
     kind: notification.kind,
     botId: notification.botId,
     botName: notification.botName,
+    statusTitle: notification.title,
     threadId: notification.threadId,
     ...(notification.roomId && notification.roomName ? { roomId: notification.roomId, roomName: notification.roomName } : {}),
+    ...(botVisual ? { botVisual } : {}),
     ...(request.pairing ? { pairing: request.pairing } : {}),
   };
+}
+
+/**
+ * iOS UserNotifications suppresses `alert.title` when it equals `CFBundleDisplayName` ("MausBot"),
+ * leaving only the body line visible if the Notification Service Extension did not intercept it.
+ */
+function distinctIosTitle(title: string): string {
+  return title.trim().toLowerCase() === "mausbot" ? `${title}\u2060` : title;
 }
 
 /** `body` repeats `omb` because expo-notifications (SDK 58) exposes only `body` as `notification.request.content.data`. */
@@ -121,11 +136,12 @@ export function buildApnsAlertPayload(request: DirectApnsSendRequest) {
   return {
     aps: {
       alert: {
-        title: notification.title,
+        title: distinctIosTitle(notification.title),
         ...(request.alertSubtitle ? { subtitle: request.alertSubtitle } : {}),
         ...(request.alertBody ? { body: request.alertBody } : {}),
       },
       sound: "default",
+      "mutable-content": 1,
       "thread-id": notification.threadId,
       category: pushCategory(notification.kind),
       "interruption-level": NEEDS_YOU.has(notification.kind) ? "time-sensitive" : "active",
@@ -175,9 +191,12 @@ export function buildApnsLiveActivityPayload(request: DirectApnsActivityRequest,
   const contentState = { name: LIVE_ACTIVITY_NAME, props: JSON.stringify(buildActivityProps(request.activity)) };
   const staleSeconds = request.staleSeconds ?? APNS_ACTIVITY_STALE_SECONDS;
   const dismissalSeconds = request.dismissalSeconds ?? seconds;
+  const silentTitle = request.activity.botName.trim().toLowerCase() === "mausbot"
+    ? request.activity.headline
+    : request.activity.botName;
   const startAlert = request.silentStartAlert
-    ? { title: request.activity.botName, body: request.activity.status ?? request.activity.headline }
-    : { title: request.activity.headline, body: request.activity.status ?? request.activity.botName, sound: "default" as const };
+    ? { title: silentTitle, body: request.activity.status ?? request.activity.headline }
+    : { title: distinctIosTitle(request.activity.headline), body: request.activity.status ?? request.activity.botName, sound: "default" as const };
   return {
     aps: {
       timestamp: seconds,

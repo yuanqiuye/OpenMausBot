@@ -3110,7 +3110,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           showNotification(
             frame.notification,
             (target) => openThread(dispatch, target, stateRef.current, showThreadsRef.current),
-            stateRef.current.bots.find((bot) => bot.id === frame.notification.botId)?.avatarUrl,
+            stateRef.current.bots.find((bot) => bot.id === frame.notification.botId),
             visibleNotificationThread(stateRef.current, frame.notification.threadId),
           );
           rawDispatch({ type: "notificationReceived", entry: frame.notification });

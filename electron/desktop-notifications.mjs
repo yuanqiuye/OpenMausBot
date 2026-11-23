@@ -9,6 +9,8 @@ const TEXT_LIMIT = 1024;
  * must not jump to an old banner's thread. */
 const PLACE_WAIT_MS = 2 * 60_000;
 const ICON_WAIT_MS = 1_500;
+const DATA_PNG_PREFIX = "data:image/png;base64,";
+const ICON_DATA_LIMIT = 256 * 1024;
 
 const text = (value) => (typeof value === "string" ? value.slice(0, TEXT_LIMIT) : "");
 const originOf = (url) => { try { return new URL(url).origin; } catch { return null; } };
@@ -51,6 +53,14 @@ export function installDesktopNotifications({ ipcMain, Notification, nativeImage
 
   const pictureOf = async (origin, raw) => {
     if (typeof raw !== "string" || !raw) return null;
+    if (raw.startsWith(DATA_PNG_PREFIX)) {
+      const encoded = raw.slice(DATA_PNG_PREFIX.length);
+      if (!encoded || encoded.length > ICON_DATA_LIMIT) return null;
+      try {
+        const image = nativeImage.createFromBuffer(Buffer.from(encoded, "base64"));
+        return image.isEmpty() ? null : image;
+      } catch { return null; }
+    }
     try {
       const url = new URL(raw, origin);
       if (url.origin !== origin) return null;

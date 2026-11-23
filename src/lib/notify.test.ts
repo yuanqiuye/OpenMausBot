@@ -7,6 +7,7 @@ vi.mock("./notification-preferences", () => ({
 }));
 
 import { setLocale } from "./i18n";
+import { botNotificationIcon, type CanvasFactoryResult } from "./notify-icon";
 import {
   buildNotificationOptions,
   requestNotificationPermission,
@@ -244,6 +245,52 @@ describe("buildNotificationOptions", () => {
       tag: "openmausbot:bot-9",
       icon: undefined,
     });
+  });
+
+  it("renders a PNG data URL icon for mascot bots and prepends bot name when omitted from routine titles", () => {
+    class FakePath2D {
+      constructor(public d?: string) {}
+    }
+    vi.stubGlobal("Path2D", FakePath2D);
+    const fakeCanvas = (): CanvasFactoryResult => ({
+      getContext: () => ({
+        save: () => {},
+        restore: () => {},
+        translate: () => {},
+        scale: () => {},
+        beginPath: () => {},
+        arc: () => {},
+        roundRect: () => {},
+        moveTo: () => {},
+        lineTo: () => {},
+        quadraticCurveTo: () => {},
+        closePath: () => {},
+        fill: () => {},
+        stroke: () => {},
+        createLinearGradient: () => ({ addColorStop: () => {} }),
+        fillStyle: "",
+        strokeStyle: "",
+        lineWidth: 1,
+        lineCap: "round",
+      }),
+      toDataURL: () => "data:image/png;base64,iVBORw0KGgo=",
+    });
+
+    const pngUrl = botNotificationIcon(
+      { id: "bot-mascot", color: "orange", mascotBody: "blob", avatarCrop: "mascot" },
+      "approval",
+      fakeCanvas,
+    );
+    expect(pngUrl).toBe("data:image/png;base64,iVBORw0KGgo=");
+
+    const { notices } = installNotification("granted");
+    showNotification(
+      { ...frame, kind: "routine-failed", title: "Routine \"Nightly\" failed" },
+      vi.fn(),
+      { id: "bot-1", name: "Scout", avatarUrl: "/api/attachments/scout.png" },
+    );
+    expect(notices[0]?.title).toBe("Scout · Routine \"Nightly\" failed");
+    expect(notices[0]?.options?.icon).toBe("/api/attachments/scout.png");
   });
 });
 

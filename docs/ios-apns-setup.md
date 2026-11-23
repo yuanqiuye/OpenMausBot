@@ -2,7 +2,7 @@
 
 OpenMausBot 支援透過你自己的 **Apple Developer `.p8` 推播金鑰（APNs AuthKey）**，直接從本地電腦向已配對的 iPhone / iPad 發送：
 
-1. **關掉 App 後的三層豐富背景通知（Alert Push）**：支援 `approval`（需要核准）、`question`（機器人提問）、`sign-in` / `secret`（需要登入或提供憑證）、`done`（回覆完成）、`turn-failed` / `routine-failed` / `incident`（異常與失敗提醒）與 `mention`（群組點名），預設顯示 **機器人狀態標題 + 對話主題副標題 + 回覆/請求摘要預覽**（亦可在設定中關閉預覽切換為純無內容隱私模式）。
+1. **關掉 App 後的三層豐富背景通知（Communication Notification + 機器人頭像）**：支援 `approval`（需要核准）、`question`（機器人提問）、`sign-in` / `secret`（需要登入或提供憑證）、`done`（回覆完成）、`turn-failed` / `routine-failed` / `incident`（異常與失敗提醒）與 `mention`（群組點名），以 iOS Communication Notification 顯示 **機器人專屬頭像/吉祥物圖示 + 機器人名稱 + 對話主題副標題 + 回覆/請求摘要預覽**（亦可在設定中關閉預覽切換為純無內容隱私模式）。
 2. **鎖屏即時動態與靈動島全生命週期（ActivityKit Live Activity Push）**：在背景執行超過 1.5 秒時自動遠端喚起靈動島（`push-to-start`）、每 6 秒節流推送目前工具步驟、卡在核准/提問時顯示具體原因與雙膠囊操作按鈕、完成時顯示 `✓` 勾勾與完成摘要停留 45 秒後自動收合。
 
 全程由你的電腦直連 Apple APNs，不經過任何第三方中繼伺服器。
@@ -22,12 +22,20 @@ OpenMausBot 支援透過你自己的 **Apple Developer `.p8` 推播金鑰（APNs
    - 前往 **Identifiers → App Groups**，新增例如 `group.com.yourname.mausbot`。
 
 3. **建立 App IDs**：
-   - **主程式 App ID**（例如 `com.yourname.mausbot`）：勾選 **Push Notifications** 與 **App Groups**（綁定上面的 `group.com.yourname.mausbot`）。
+   - **主程式 App ID**（例如 `com.yourname.mausbot`）：勾選 **Push Notifications**、**Communication Notifications** 與 **App Groups**（綁定上面的 `group.com.yourname.mausbot`）。
    - **靈動島 Widget Extension App ID**（例如 `com.yourname.mausbot.widgets`）：勾選 **App Groups**（綁定同一個 `group.com.yourname.mausbot`）。
-   - *(選用)* 若想保留系統分享選單擴充功能，再建立 `com.yourname.mausbot.share` 並勾選同一個 **App Groups**；否則重簽時加上 `--strip-share-extension` 即可省去第 3 個描述檔。
+   - **機器人頭像通知擴充 App ID**（例如 `com.yourname.mausbot.notification-service`）：勾選 **App Groups**（綁定同一個 `group.com.yourname.mausbot`），讓背景推播也能動態繪製機器人頭像與名稱。
+   - *(選用)* 若想保留系統分享選單擴充功能，再建立 `com.yourname.mausbot.share` 並勾選同一個 **App Groups**；否則重簽時加上 `--strip-share-extension` 即可省去第 4 個描述檔。
 
-4. **產生 Provisioning Profiles（若使用命令列 `codesign`）**：
-   - 為 `com.yourname.mausbot` 與 `com.yourname.mausbot.widgets` 分別建立 **iOS App Development**（對應 `sandbox`）或 **Ad Hoc**（對應 `production`）描述檔（`.mobileprovision`），並勾選你的 iPhone UDID。
+4. **自動或手動產生 Provisioning Profiles（若使用命令列 `codesign`）**：
+   - **自動產生（推薦）**：若本機 Xcode 已登入 Apple Developer 帳號並連接 iPhone，可直接執行：
+     ```bash
+     node scripts/ios/provision-ipa-profiles.mjs \
+       --team-id YOURTEAM10 \
+       --bundle-id com.yourname.mausbot
+     ```
+     Xcode 會自動註冊 App IDs / Capabilities 並下載主程式、`.widgets` 與 `.notification-service` 的 `.mobileprovision`。
+   - **手動產生**：為 `com.yourname.mausbot`、`com.yourname.mausbot.widgets` 與 `com.yourname.mausbot.notification-service` 分別建立 **iOS App Development**（對應 `sandbox`）或 **Ad Hoc**（對應 `production`）描述檔（`.mobileprovision`），並勾選你的 iPhone UDID。
 
 ---
 
@@ -62,7 +70,8 @@ node scripts/ios/resign-ipa-apns.mjs \
   --strip-share-extension \
   --identity "Apple Development: Your Name (XXXXXXXXXX)" \
   --profile ~/Downloads/MausBot_Dev.mobileprovision \
-  --widgets-profile ~/Downloads/MausBot_Widgets_Dev.mobileprovision
+  --widgets-profile ~/Downloads/MausBot_Widgets_Dev.mobileprovision \
+  --nse-profile ~/Downloads/MausBot_NSE_Dev.mobileprovision
 ```
 
 簽名完成後，可用 **Xcode → Window → Devices and Simulators** 或 **Apple Configurator** 安裝 `MausBot-2.0.0-apns-signed.ipa`。
@@ -73,9 +82,10 @@ node scripts/ios/resign-ipa-apns.mjs \
 - `MausBot.app/Info.plist`：
   - 開啟 `ExpoWidgets_EnablePushNotifications = true`（啟用靈動島 ActivityKit 遠端推播 Token）。
   - 開啟 `NSSupportsLiveActivities = true` 與 `NSSupportsLiveActivitiesFrequentUpdates = true`（解鎖 iOS「設定 → App → MausBot → 即時動態 → 更頻繁的更新」高頻更新預算）。
-  - 在 `UIBackgroundModes` 加入 `remote-notification`。
+  - 在 `UIBackgroundModes` 加入 `remote-notification`，並在 `NSUserActivityTypes` 加入 `INSendMessageIntent`（啟用 Communication Notification 機器人頭像橫幅）。
   - 將 `CFBundleIdentifier`、`OpenMausAppGroup`、`ExpoWidgetsAppGroupIdentifier`、`OpenMausKeychainAccessGroup`、`OpenMausLegacyKeychainAccessGroup` 對齊至你的 `Team ID` 與 `Bundle ID`（避免 iOS Keychain `-34018` `errSecMissingEntitlement` 閃退或無法儲存配對金鑰）。
 - `PlugIns/ExpoWidgetsTarget.appex/Info.plist`：同步更新為 `<bundleId>.widgets` 與相同 App Group。
+- 當提供 `--nse-profile` 時，自動編譯並嵌入 `PlugIns/NotificationService.appex`（遠端 APNs 機器人頭像與名稱升級擴充）與 `Frameworks/OmbNotificationAvatar.dylib`（App 前景/剛退背景 SSE 本地通知機器人頭像與名稱升級）。
 
 ---
 

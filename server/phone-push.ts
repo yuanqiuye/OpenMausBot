@@ -31,6 +31,7 @@ import {
   type PushKind,
 } from "../shared/phone-push.ts";
 import { apnsConfigWithEnv, resolveApnsConfig, usableApnsPrivateKey, type ApnsConfig, type ApnsEnvironment, type ResolvedApnsConfig } from "./apns-config.ts";
+import { resolveBotNotificationVisual, type BotNotificationVisual } from "../shared/bot-notification-visual.ts";
 import { ApnsDirectClient, type DirectApnsActivityRequest } from "./apns-direct.ts";
 import { writeFileAtomic } from "./atomic.ts";
 import { redactSecretsInText } from "./redact.ts";
@@ -186,6 +187,8 @@ export interface PhonePushOptions {
   room: (notification: PushableNotification) => { id: string; name: string } | undefined;
   /** Optional conversation/task title for local direct APNs subtitles (never sent to the hosted relay). */
   threadTitle?: (threadId: string, botId: string) => string | undefined;
+  /** Optional bot appearance lookup for local direct APNs Communication Notification icons (never sent to the hosted relay). */
+  bot?: (botId: string) => { color?: unknown; mascotBody?: unknown; mascotFaceColor?: unknown } | null | undefined;
   fetchImpl?: typeof fetch;
   now?: () => number;
   log?: (line: string) => void;
@@ -210,6 +213,7 @@ interface Job {
   directTitle?: string;
   directSubtitle?: string;
   directBody?: string;
+  botVisual?: BotNotificationVisual;
   collapseId?: string;
   queuedAt: number;
   notBefore: number;
@@ -513,6 +517,7 @@ export class PhonePush {
       const directTitle = notification.title ? clip(redactSecretsInText(notification.title), PUSH_TITLE_MAX) : undefined;
       const directSubtitle = cleanSubtitle(this.options.threadTitle?.(notification.threadId, notification.botId), push.botName, push.roomName);
       const directBody = notification.body ? clip(redactSecretsInText(notification.body), PUSH_PREVIEW_MAX) : undefined;
+      const botVisual = apns ? resolveBotNotificationVisual(this.options.bot?.(notification.botId), notification.kind) : undefined;
       const collapseId = phonePushCollapseId(push.threadId, frame.seq);
       const now = this.now();
       for (const device of this.devices) {
@@ -531,6 +536,7 @@ export class PhonePush {
           ...(directTitle ? { directTitle } : {}),
           ...(directSubtitle ? { directSubtitle } : {}),
           ...(directBody ? { directBody } : {}),
+          ...(botVisual ? { botVisual } : {}),
           ...(collapseId ? { collapseId } : {}),
           queuedAt: now,
           notBefore: waiting?.notBefore ?? now,
@@ -607,11 +613,13 @@ export class PhonePush {
     const apns = device.platform === "apns" ? this.options.apns?.() : null;
     if (apns) {
       const rich = apns.includePreview;
+      const botVisual = job.botVisual ?? resolveBotNotificationVisual(this.options.bot?.(job.push.botId), job.push.kind);
       const directBody = {
         ...body,
         notification: rich && job.directTitle ? { ...job.push, title: job.directTitle } : job.push,
         ...(rich && job.directSubtitle ? { alertSubtitle: job.directSubtitle } : {}),
         ...(rich && job.directBody ? { alertBody: job.directBody } : {}),
+        botVisual,
       };
       const outcome = await this.apnsClient.sendAlert(apns, device.environment, directBody);
       if (outcome.kind === "sent") {
@@ -698,6 +706,7 @@ export class PhonePush {
           ? "推送内容预览与灵动岛实时进度已成功启用。"
           : "Rich notification previews and Dynamic Island live updates are active.")
       : undefined;
+    const botVisual = resolveBotNotificationVisual(this.options.bot?.(push.botId), push.kind);
     let sent = 0;
     const reasons: string[] = [];
     for (const device of devices) {
@@ -708,6 +717,7 @@ export class PhonePush {
         notification: push,
         ...(subtitle ? { alertSubtitle: subtitle } : {}),
         ...(previewBody ? { alertBody: previewBody } : {}),
+        botVisual,
       });
       if (outcome.kind === "sent") {
         sent += 1;

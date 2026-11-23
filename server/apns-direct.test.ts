@@ -273,9 +273,68 @@ describe("apns-config and ApnsDirectClient", () => {
         subtitle: "Fix iOS notifications",
         body: "Build failed on step 3",
       },
+      "mutable-content": 1,
       sound: "default",
       "interruption-level": "time-sensitive",
     });
+
+    const mausBotNamedAlert = buildApnsAlertPayload({
+      v: 1,
+      token: "a".repeat(64),
+      alertSubtitle: "Audit PR #42",
+      alertBody: "All checks passed",
+      botVisual: {
+        color: "#788B9D",
+        gradient: ["#E2E8F0", "#788B9D", "#334155"],
+        body: "cursor",
+        faceInk: "#1E2833",
+        mood: "unread",
+      },
+      notification: { kind: "done", title: "MausBot", botId: "bot_0", botName: "MausBot", threadId: "thr_0" },
+    });
+    expect(mausBotNamedAlert.aps).toMatchObject({
+      alert: {
+        title: "MausBot\u2060",
+        subtitle: "Audit PR #42",
+        body: "All checks passed",
+      },
+      "mutable-content": 1,
+    });
+    expect((mausBotNamedAlert.aps.alert as { title: string }).title).not.toBe("MausBot");
+    expect(mausBotNamedAlert.omb).toMatchObject({
+      botId: "bot_0",
+      botName: "MausBot",
+      statusTitle: "MausBot",
+      botVisual: {
+        color: "#788B9D",
+        body: "cursor",
+        faceInk: "#1E2833",
+        mood: "unread",
+      },
+    });
+
+    const mausBotSilentStart = buildApnsLiveActivityPayload({
+      v: 1,
+      token: "b".repeat(64),
+      event: "start",
+      silentStartAlert: true,
+      activity: {
+        version: 1,
+        ask: "other",
+        status: "Running · pnpm test",
+        waiting: 0,
+        botId: "bot_0",
+        botName: "MausBot",
+        kind: "working",
+        headline: "MausBot is working",
+        since: 1_700_000_000_000,
+        link: "openmausbot://chat/thr_0",
+        color: "#788B9D",
+        gradient: ["#788B9D"],
+        body: "cursor",
+      },
+    }, 1_700_000_000_000);
+    expect(mausBotSilentStart.aps.alert).toEqual({ title: "MausBot is working", body: "Running · pnpm test" });
 
     const silentStart = buildApnsLiveActivityPayload({
       v: 1,

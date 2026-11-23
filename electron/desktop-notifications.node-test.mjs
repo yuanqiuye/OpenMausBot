@@ -170,6 +170,10 @@ test("a bot's picture comes only from the page's own origin, and a failed one st
     assert.equal(await w.show({ ...NOTE, tag, picture }), true);
     assert.equal(w.banners.at(-1).options.icon, undefined);
   }
+  const pngDataUrl = `data:image/png;base64,${Buffer.from("mascot-png-icon").toString("base64")}`;
+  assert.equal(await w.show({ ...NOTE, tag: "mascot", picture: pngDataUrl }), true);
+  assert.equal(w.banners.at(-1).options.icon.bytes, "mascot-png-icon".length);
+  assert.equal(w.asked.length, 3, "data:image/png icons decode inline without network fetch");
 });
 
 test("main opens a thread only from the window's own load, and a page gets the bridge whatever server it comes from", () => {
