@@ -1,6 +1,6 @@
 import { createHash, createPrivateKey, sign } from "node:crypto";
 import * as http2 from "node:http2";
-import type { PushRelayActivityRequest, PushRelaySendRequest } from "../shared/phone-push.ts";
+import type { ActivityKind, PushRelayActivityRequest, PushRelaySendRequest } from "../shared/phone-push.ts";
 import type { ApnsEnvironment, ResolvedApnsConfig } from "./apns-config.ts";
 
 export const APNS_HOSTS: Record<ApnsEnvironment, string> = {
@@ -18,9 +18,42 @@ export const LIVE_ACTIVITY_ATTRIBUTES = "LiveActivityAttributes";
 
 const APNS_REQUEST_TIMEOUT_MS = 10_000;
 const APNS_SESSION_IDLE_MS = 5 * 60 * 1_000;
-const NEEDS_YOU = new Set(["approval", "question", "sign-in", "mention"]);
+const NEEDS_YOU = new Set([
+  "approval",
+  "question",
+  "sign-in",
+  "secret",
+  "turn-failed",
+  "routine-failed",
+  "incident",
+  "mention",
+]);
 const CATEGORY: Record<string, string> = { approval: "OPENMAUS_APPROVAL", question: "OPENMAUS_QUESTION" };
 const CATEGORY_UPDATE = "OPENMAUS_UPDATE";
+
+export interface DirectApnsSendRequest extends PushRelaySendRequest {
+  alertSubtitle?: string;
+  alertBody?: string;
+}
+
+export interface DirectApnsActivityAnswer {
+  label: string;
+  link: string;
+  refusal: boolean;
+}
+
+export type DirectApnsActivityState = Omit<PushRelayActivityRequest["activity"], "kind"> & {
+  kind: ActivityKind | "idle";
+  line?: string;
+  answers?: DirectApnsActivityAnswer[];
+};
+
+export interface DirectApnsActivityRequest extends Omit<PushRelayActivityRequest, "activity"> {
+  activity: DirectApnsActivityState;
+  silentStartAlert?: boolean;
+  staleSeconds?: number;
+  dismissalSeconds?: number;
+}
 const DEAD_TOKEN_REASONS = new Set(["BadDeviceToken", "DeviceTokenNotForTopic", "Unregistered"]);
 const PROVIDER_TOKEN_REASONS = new Set(["ExpiredProviderToken", "InvalidProviderToken", "MissingProviderToken"]);
 const CREDENTIAL_REASONS = new Set([
@@ -82,12 +115,16 @@ function ombPayload(request: PushRelaySendRequest) {
 }
 
 /** `body` repeats `omb` because expo-notifications (SDK 58) exposes only `body` as `notification.request.content.data`. */
-export function buildApnsAlertPayload(request: PushRelaySendRequest) {
+export function buildApnsAlertPayload(request: DirectApnsSendRequest) {
   const { notification } = request;
   const omb = ombPayload(request);
   return {
     aps: {
-      alert: { title: notification.title },
+      alert: {
+        title: notification.title,
+        ...(request.alertSubtitle ? { subtitle: request.alertSubtitle } : {}),
+        ...(request.alertBody ? { body: request.alertBody } : {}),
+      },
       sound: "default",
       "thread-id": notification.threadId,
       category: pushCategory(notification.kind),
@@ -98,7 +135,8 @@ export function buildApnsAlertPayload(request: PushRelaySendRequest) {
   };
 }
 
-export function buildActivityProps(activity: PushRelayActivityRequest["activity"]) {
+export function buildActivityProps(activity: DirectApnsActivityState) {
+  const answers = activity.kind === "needsYou" && activity.answers?.length ? activity.answers.slice(0, 2) : [];
   if (activity.version === 1) {
     return {
       version: 1,
@@ -113,7 +151,7 @@ export function buildActivityProps(activity: PushRelayActivityRequest["activity"
       waiting: activity.waiting,
       since: activity.since,
       link: activity.link,
-      answers: [],
+      answers,
     };
   }
   return {
@@ -125,24 +163,29 @@ export function buildActivityProps(activity: PushRelayActivityRequest["activity"
     mood: activity.kind,
     kind: activity.kind,
     headline: activity.headline,
-    line: "",
+    line: activity.line ?? "",
     since: activity.since,
     link: activity.link,
-    answers: [],
+    answers,
   };
 }
 
-export function buildApnsLiveActivityPayload(request: PushRelayActivityRequest, now: number) {
+export function buildApnsLiveActivityPayload(request: DirectApnsActivityRequest, now: number) {
   const seconds = Math.floor(now / 1_000);
   const contentState = { name: LIVE_ACTIVITY_NAME, props: JSON.stringify(buildActivityProps(request.activity)) };
+  const staleSeconds = request.staleSeconds ?? APNS_ACTIVITY_STALE_SECONDS;
+  const dismissalSeconds = request.dismissalSeconds ?? seconds;
+  const startAlert = request.silentStartAlert
+    ? { title: request.activity.botName, body: request.activity.status ?? request.activity.headline }
+    : { title: request.activity.headline, body: request.activity.status ?? request.activity.botName, sound: "default" as const };
   return {
     aps: {
       timestamp: seconds,
       event: request.event,
       "content-state": contentState,
-      ...(request.event === "end" ? { "dismissal-date": seconds } : { "stale-date": seconds + APNS_ACTIVITY_STALE_SECONDS }),
+      ...(request.event === "end" ? { "dismissal-date": dismissalSeconds } : { "stale-date": seconds + staleSeconds }),
       ...(request.event === "start" ? { "attributes-type": LIVE_ACTIVITY_ATTRIBUTES, attributes: { url: request.activity.link } } : {}),
-      ...(request.event === "start" ? { alert: { title: request.activity.headline, body: request.activity.botName, sound: "default" } } : {}),
+      ...(request.event === "start" ? { alert: startAlert } : {}),
     },
   };
 }
@@ -342,7 +385,7 @@ export class ApnsDirectClient {
   async sendAlert(
     config: ResolvedApnsConfig,
     environment: ApnsEnvironment,
-    request: PushRelaySendRequest,
+    request: DirectApnsSendRequest,
   ): Promise<ApnsDeliveryResult> {
     const now = this.now();
     const collapseId = request.collapseId ?? sha256Hex(`${request.notification.kind}:${request.notification.threadId}`).slice(0, 32);
@@ -362,7 +405,7 @@ export class ApnsDirectClient {
   async sendActivity(
     config: ResolvedApnsConfig,
     environment: ApnsEnvironment,
-    request: PushRelayActivityRequest,
+    request: DirectApnsActivityRequest,
   ): Promise<ApnsDeliveryResult> {
     const now = this.now();
     return this.deliver({
@@ -370,7 +413,7 @@ export class ApnsDirectClient {
       environment,
       token: request.token,
       pushType: "liveactivity",
-      priority: request.event === "start" ? 10 : 5,
+      priority: request.event === "start" || request.activity.kind === "needsYou" ? 10 : 5,
       expiresInSeconds: APNS_ACTIVITY_EXPIRATION_SECONDS,
       payload: buildApnsLiveActivityPayload(request, now),
       now,

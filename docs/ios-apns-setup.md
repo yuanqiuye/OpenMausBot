@@ -2,10 +2,10 @@
 
 OpenMausBot 支援透過你自己的 **Apple Developer `.p8` 推播金鑰（APNs AuthKey）**，直接從本地電腦向已配對的 iPhone / iPad 發送：
 
-1. **關掉 App 後的背景通知（Alert Push）**：`approval`（需要核准）、`question`（機器人提問）、`sign-in`（需要登入網站）、`done`（回覆完成）。
-2. **鎖屏即時動態與靈動島背景更新（ActivityKit Live Activity Push）**：在 App 退到背景時自動遠端啟動（`push-to-start`）、更新進度與收合靈動島。
+1. **關掉 App 後的三層豐富背景通知（Alert Push）**：支援 `approval`（需要核准）、`question`（機器人提問）、`sign-in` / `secret`（需要登入或提供憑證）、`done`（回覆完成）、`turn-failed` / `routine-failed` / `incident`（異常與失敗提醒）與 `mention`（群組點名），預設顯示 **機器人狀態標題 + 對話主題副標題 + 回覆/請求摘要預覽**（亦可在設定中關閉預覽切換為純無內容隱私模式）。
+2. **鎖屏即時動態與靈動島全生命週期（ActivityKit Live Activity Push）**：在背景執行超過 1.5 秒時自動遠端喚起靈動島（`push-to-start`）、每 6 秒節流推送目前工具步驟、卡在核准/提問時顯示具體原因與雙膠囊操作按鈕、完成時顯示 `✓` 勾勾與完成摘要停留 45 秒後自動收合。
 
-全程不經過第三方中繼伺服器，且推播內容維持隱私設計（僅含事件類型、機器人名稱與對話 ID，絕不把對話原文送到 Apple APNs）。
+全程由你的電腦直連 Apple APNs，不經過任何第三方中繼伺服器。
 
 ---
 
@@ -72,6 +72,7 @@ node scripts/ios/resign-ipa-apns.mjs \
 - `EXConstants.bundle/app.config`：開啟 `extra.remotePush = { enabled: true, apnsEnvironment }`，並將 `scheme` 對齊為 `"openmausbot"`，確保點擊推播或靈動島能跳回對應對話。
 - `MausBot.app/Info.plist`：
   - 開啟 `ExpoWidgets_EnablePushNotifications = true`（啟用靈動島 ActivityKit 遠端推播 Token）。
+  - 開啟 `NSSupportsLiveActivities = true` 與 `NSSupportsLiveActivitiesFrequentUpdates = true`（解鎖 iOS「設定 → App → MausBot → 即時動態 → 更頻繁的更新」高頻更新預算）。
   - 在 `UIBackgroundModes` 加入 `remote-notification`。
   - 將 `CFBundleIdentifier`、`OpenMausAppGroup`、`ExpoWidgetsAppGroupIdentifier`、`OpenMausKeychainAccessGroup`、`OpenMausLegacyKeychainAccessGroup` 對齊至你的 `Team ID` 與 `Bundle ID`（避免 iOS Keychain `-34018` `errSecMissingEntitlement` 閃退或無法儲存配對金鑰）。
 - `PlugIns/ExpoWidgetsTarget.appex/Info.plist`：同步更新為 `<bundleId>.widgets` 與相同 App Group。

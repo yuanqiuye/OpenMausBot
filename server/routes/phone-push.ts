@@ -16,6 +16,7 @@ export const PHONE_APNS_TEST_ROUTE = "/api/push/apns/test";
 
 const apnsSettingsBody = z.object({
   enabled: z.boolean().optional(),
+  includePreview: z.boolean().optional(),
   teamId: z.string().max(32).optional(),
   keyId: z.string().max(32).optional(),
   bundleId: z.string().max(155).optional(),
@@ -128,6 +129,7 @@ export function createPhoneApnsRoutes(deps: PhoneApnsRouteDeps): RouteHandler {
     try {
       const apns = await deps.save({
         ...(parsed.data.enabled !== undefined ? { enabled: parsed.data.enabled } : {}),
+        ...(parsed.data.includePreview !== undefined ? { includePreview: parsed.data.includePreview } : {}),
         ...(checked.normalized.teamId !== undefined ? { teamId: checked.normalized.teamId } : {}),
         ...(checked.normalized.keyId !== undefined ? { keyId: checked.normalized.keyId } : {}),
         ...(checked.normalized.bundleId !== undefined ? { bundleId: checked.normalized.bundleId } : {}),

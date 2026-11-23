@@ -12,6 +12,7 @@ export type NestedKeyName = "ttsKey" | "fishAudioKey" | "geminiTtsKey" | "jevApi
 
 export interface ApnsStatusSummary {
   enabled: boolean;
+  includePreview: boolean;
   configured: boolean;
   teamId: string;
   keyId: string;

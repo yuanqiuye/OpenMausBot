@@ -7969,6 +7969,8 @@
   "phone.apns.statusNotSetUp": "未設定",
   "phone.apns.enabled": "iOS プッシュ通知を送信",
   "phone.apns.enabledDetail": "承認、質問、サインイン要求、完了した返信、ライブアクティビティ更新のためにペアリング済み iPhone を起動します。",
+  "phone.apns.includePreview": "メッセージプレビューを表示",
+  "phone.apns.includePreviewDetail": "通知とダイナミックアイランドに会話タイトル、返信の要約、ライブ実行ステップを含めます。",
   "phone.apns.environment": "APNs 環境",
   "phone.apns.environmentDetail": "IPA の署名に使ったプロビジョニングプロファイルに合わせてください（Development は Sandbox、App Store または Ad Hoc は Production）。",
   "phone.apns.environmentSandbox": "Sandbox (Development)",

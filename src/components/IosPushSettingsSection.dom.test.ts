@@ -14,6 +14,7 @@ const fixture = vi.hoisted(() => ({
   config: {
     apns: {
       enabled: true,
+      includePreview: true,
       configured: false,
       teamId: "",
       keyId: "",
@@ -49,6 +50,7 @@ beforeEach(() => {
   fixture.config = {
     apns: {
       enabled: true,
+      includePreview: true,
       configured: false,
       teamId: "",
       keyId: "",
@@ -83,6 +85,7 @@ describe("IosPushSettingsSection", () => {
     fixture.api.mockResolvedValueOnce({
       apns: {
         enabled: true,
+        includePreview: true,
         configured: true,
         teamId: "TEAM123456",
         keyId: "KEY1234567",
@@ -103,6 +106,7 @@ describe("IosPushSettingsSection", () => {
       method: "PUT",
       body: JSON.stringify({
         enabled: true,
+        includePreview: true,
         environment: "sandbox",
         teamId: "TEAM123456",
         keyId: "KEY1234567",
@@ -115,6 +119,7 @@ describe("IosPushSettingsSection", () => {
     fixture.config = {
       apns: {
         enabled: true,
+        includePreview: true,
         configured: true,
         teamId: "TEAM123456",
         keyId: "KEY1234567",
@@ -134,5 +139,31 @@ describe("IosPushSettingsSection", () => {
 
     await vi.waitFor(() => expect(fixture.api).toHaveBeenCalledWith("/api/push/apns/test", { method: "POST", body: "{}" }));
     await vi.waitFor(() => expect(host.textContent).toContain("Sent test notification to 1 of 1 iPhone devices."));
+
+    const previewSwitch = host.querySelector<HTMLButtonElement>('[aria-label="Show message previews"]')!;
+    expect(previewSwitch.getAttribute("aria-checked")).toBe("true");
+    flushSync(() => previewSwitch.click());
+    expect(previewSwitch.getAttribute("aria-checked")).toBe("false");
+
+    fixture.api.mockResolvedValueOnce({
+      apns: {
+        ...fixture.config.apns,
+        includePreview: false,
+      },
+    });
+    const saveAfterToggle = host.querySelector<HTMLButtonElement>('[data-testid="apns-save"]')!;
+    expect(saveAfterToggle.disabled).toBe(false);
+    flushSync(() => saveAfterToggle.click());
+    await vi.waitFor(() => expect(fixture.api).toHaveBeenLastCalledWith("/api/push/apns", {
+      method: "PUT",
+      body: JSON.stringify({
+        enabled: true,
+        includePreview: false,
+        environment: "sandbox",
+        teamId: "TEAM123456",
+        keyId: "KEY1234567",
+        bundleId: "com.example.mausbot",
+      }),
+    }));
   });
 });

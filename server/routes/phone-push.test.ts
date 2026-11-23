@@ -173,6 +173,7 @@ describe("/api/push/apns", () => {
       body: {
         apns: {
           enabled: true,
+          includePreview: true,
           configured: true,
           teamId: "TEAM123456",
           keyId: "KEY1234567",

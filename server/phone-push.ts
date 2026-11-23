@@ -29,11 +29,11 @@ import {
   type PhonePushState,
   type PublicPushDevice,
   type PushKind,
-  type PushRelayActivityRequest,
 } from "../shared/phone-push.ts";
 import { apnsConfigWithEnv, resolveApnsConfig, usableApnsPrivateKey, type ApnsConfig, type ApnsEnvironment, type ResolvedApnsConfig } from "./apns-config.ts";
-import { ApnsDirectClient } from "./apns-direct.ts";
+import { ApnsDirectClient, type DirectApnsActivityRequest } from "./apns-direct.ts";
 import { writeFileAtomic } from "./atomic.ts";
+import { redactSecretsInText } from "./redact.ts";
 import { conversationLanguage, serverLine, type ServerLineKey } from "./server-lines.ts";
 
 export const PHONE_PUSH_FILE = "push-devices.json";
@@ -66,6 +66,32 @@ const TITLES: Record<PushKind, ServerLineKey> = {
   done: "server.notify.done",
 };
 
+const DIRECT_TITLES: Record<string, ServerLineKey> = {
+  ...TITLES,
+  secret: "server.notify.approval",
+  "turn-failed": "server.notify.turnFailed",
+  "routine-failed": "server.notify.routineFailed",
+  incident: "server.notify.incident",
+  mention: "server.notify.mention",
+  wait: "server.notify.wait",
+};
+
+const DIRECT_KIND_SWITCHES: Record<string, readonly PushKind[]> = {
+  approval: ["approval"],
+  question: ["question"],
+  "sign-in": ["sign-in"],
+  secret: ["sign-in", "approval"],
+  done: ["done"],
+  mention: ["done"],
+  wait: ["done"],
+  "turn-failed": ["done", "approval", "question", "sign-in"],
+  "routine-failed": ["done", "approval", "question", "sign-in"],
+  incident: ["done", "approval", "question", "sign-in"],
+};
+
+const PUSH_PREVIEW_MAX = 180;
+const GENERIC_THREAD_TITLES = new Set(["shared chat", "new task", "new thread", "new chat"]);
+
 /** On when switched on (`OMB_PHONE_PUSH=1|0` wins over `features.phonePush`), or when local direct APNs is configured. */
 export function phonePushEnabled(
   cfg: { features?: { phonePush?: boolean }; apns?: ApnsConfig },
@@ -79,6 +105,7 @@ export function phonePushEnabled(
 
 export interface ApnsStatus {
   enabled: boolean;
+  includePreview: boolean;
   configured: boolean;
   teamId: string;
   keyId: string;
@@ -96,6 +123,7 @@ export function apnsStatusFor(
   const apns = cfg.apns;
   return {
     enabled: apns?.enabled !== false,
+    includePreview: apns?.includePreview !== false,
     configured: resolveApnsConfig(apns) !== null,
     teamId: apns?.teamId?.trim().toUpperCase() ?? "",
     keyId: apns?.keyId?.trim().toUpperCase() ?? "",
@@ -156,25 +184,32 @@ export interface PhonePushOptions {
   live: (key: string) => boolean;
   /** The room a notification came out of, for its name. */
   room: (notification: PushableNotification) => { id: string; name: string } | undefined;
+  /** Optional conversation/task title for local direct APNs subtitles (never sent to the hosted relay). */
+  threadTitle?: (threadId: string, botId: string) => string | undefined;
   fetchImpl?: typeof fetch;
   now?: () => number;
   log?: (line: string) => void;
   timers?: { set(run: () => void, ms: number): unknown; clear(handle: unknown): void };
 }
 
-/** The fields a push reads from a `notify` frame's notification: never its `body`. */
+/** The fields a push reads from a `notify` frame's notification; `title`/`body` stay local to direct APNs. */
 export interface PushableNotification {
   kind: string;
   botId: string;
   botName: string;
   threadId: string;
   groupId?: string;
+  title?: string;
+  body?: string;
 }
 
 interface Job {
   key: string;
   slot: string;
   push: PhonePushNotification;
+  directTitle?: string;
+  directSubtitle?: string;
+  directBody?: string;
   collapseId?: string;
   queuedAt: number;
   notBefore: number;
@@ -194,27 +229,54 @@ function clip(value: string, max: number): string {
 
 function pushableOf(value: unknown): PushableNotification | null {
   if (!value || typeof value !== "object") return null;
-  const { kind, botId, botName, threadId, groupId } = value as Record<string, unknown>;
+  const { kind, botId, botName, threadId, groupId, title, body } = value as Record<string, unknown>;
   if (typeof kind !== "string" || typeof botId !== "string" || typeof botName !== "string" || typeof threadId !== "string") return null;
-  return { kind, botId, botName, threadId, ...(typeof groupId === "string" ? { groupId } : {}) };
+  return {
+    kind,
+    botId,
+    botName,
+    threadId,
+    ...(typeof groupId === "string" ? { groupId } : {}),
+    ...(typeof title === "string" ? { title } : {}),
+    ...(typeof body === "string" ? { body } : {}),
+  };
 }
 
-/** The push for one notification, or null when it is not a kind a closed app is woken for or an id is not one the
- * relay takes. Reads the kind, the ids and the names; the title is the server's own line for that kind, from names. */
-export function phonePushNotification(notification: PushableNotification, room?: { id: string; name: string }): PhonePushNotification | null {
-  if (!isPushKind(notification.kind) || !PUSH_ID.test(notification.botId) || !PUSH_ID.test(notification.threadId)) return null;
+function buildPushNotification(
+  notification: PushableNotification,
+  room: { id: string; name: string } | undefined,
+  titleKey: ServerLineKey,
+): PhonePushNotification | null {
+  if (!PUSH_ID.test(notification.botId) || !PUSH_ID.test(notification.threadId)) return null;
   const botName = clip(notification.botName, PUSH_NAME_MAX) || "MausBot";
   const roomName = room && PUSH_ID.test(room.id) ? clip(room.name, PUSH_NAME_MAX) : "";
   const language = conversationLanguage(notification.threadId);
   const who = roomName ? serverLine(language, "server.notify.inRoom", { bot: botName, room: roomName }) : botName;
   return {
     kind: notification.kind,
-    title: clip(serverLine(language, TITLES[notification.kind], { who }), PUSH_TITLE_MAX),
+    title: clip(serverLine(language, titleKey, { who }), PUSH_TITLE_MAX),
     botId: notification.botId,
     botName,
     threadId: notification.threadId,
     ...(room && roomName ? { roomId: room.id, roomName } : {}),
   };
+}
+
+function cleanSubtitle(raw: string | undefined, botName: string, roomName?: string): string | undefined {
+  if (!raw) return undefined;
+  const cleaned = clip(redactSecretsInText(raw), PUSH_NAME_MAX);
+  if (!cleaned) return undefined;
+  const lower = cleaned.toLowerCase();
+  if (GENERIC_THREAD_TITLES.has(lower)) return undefined;
+  if (cleaned === botName || (roomName && cleaned === roomName)) return undefined;
+  return cleaned;
+}
+
+/** The push for one notification, or null when it is not a kind a closed app is woken for or an id is not one the
+ * relay takes. Reads the kind, the ids and the names; the title is the server's own line for that kind, from names. */
+export function phonePushNotification(notification: PushableNotification, room?: { id: string; name: string }): PhonePushNotification | null {
+  if (!isPushKind(notification.kind)) return null;
+  return buildPushNotification(notification, room, TITLES[notification.kind]);
 }
 
 export class PhonePush {
@@ -302,6 +364,19 @@ export class PhonePush {
     return this.options.apns?.()?.defaultEnvironment ?? "production";
   }
 
+  hasDirectApns(): boolean {
+    return Boolean(this.options.enabled() && this.options.apns?.());
+  }
+
+  includePreview(): boolean {
+    const apns = this.options.apns?.();
+    return Boolean(apns && apns.includePreview);
+  }
+
+  threadTitleOf(threadId: string, botId: string): string | undefined {
+    return this.options.threadTitle?.(threadId, botId);
+  }
+
   isLive(key: string): boolean {
     return this.options.live(key);
   }
@@ -338,7 +413,7 @@ export class PhonePush {
         const known = phoneEnv
           ?? this.activityTokens.find((entry) => entry.token === record.token)?.environment
           ?? apns.defaultEnvironment;
-        const outcome = await this.apnsClient.sendActivity(apns, known, body as PushRelayActivityRequest);
+        const outcome = await this.apnsClient.sendActivity(apns, known, body as DirectApnsActivityRequest);
         if (outcome.kind === "sent") return { status: 202 };
         if (outcome.kind === "dead") {
           this.activityTokens = this.activityTokens.filter((entry) => entry.token !== record.token);
@@ -428,17 +503,39 @@ export class PhonePush {
     try {
       if (!this.devices.length || !this.options.enabled()) return;
       const notification = pushableOf(frame.notification);
-      if (!notification || !isPushKind(notification.kind)) return;
-      const push = phonePushNotification(notification, this.options.room(notification));
+      if (!notification) return;
+      const apns = this.options.apns?.() ?? null;
+      const titleKey = apns ? DIRECT_TITLES[notification.kind] : (isPushKind(notification.kind) ? TITLES[notification.kind] : undefined);
+      if (!titleKey) return;
+      const room = this.options.room(notification);
+      const push = buildPushNotification(notification, room, titleKey);
       if (!push) return;
+      const directTitle = notification.title ? clip(redactSecretsInText(notification.title), PUSH_TITLE_MAX) : undefined;
+      const directSubtitle = cleanSubtitle(this.options.threadTitle?.(notification.threadId, notification.botId), push.botName, push.roomName);
+      const directBody = notification.body ? clip(redactSecretsInText(notification.body), PUSH_PREVIEW_MAX) : undefined;
       const collapseId = phonePushCollapseId(push.threadId, frame.seq);
       const now = this.now();
       for (const device of this.devices) {
-        if (!device.kinds.includes(notification.kind) || this.options.live(device.key) || !reaches(device.key)) continue;
+        const directDevice = Boolean(apns && device.platform === "apns");
+        const wantsKind = directDevice
+          ? (DIRECT_KIND_SWITCHES[notification.kind]?.some((allowed) => device.kinds.includes(allowed)) ?? false)
+          : (isPushKind(notification.kind) && device.kinds.includes(notification.kind));
+        if (!wantsKind || this.options.live(device.key) || !reaches(device.key)) continue;
         const slot = `${device.key}|${push.kind}|${push.threadId}`;
         const waiting = this.outbox.get(slot);
         if (!waiting && now - (this.lastBySlot.get(slot) ?? -Infinity) < PUSH_COALESCE_MS) continue;
-        this.outbox.set(slot, { key: device.key, slot, push, ...(collapseId ? { collapseId } : {}), queuedAt: now, notBefore: waiting?.notBefore ?? now, attempts: waiting?.attempts ?? 0 });
+        this.outbox.set(slot, {
+          key: device.key,
+          slot,
+          push,
+          ...(directTitle ? { directTitle } : {}),
+          ...(directSubtitle ? { directSubtitle } : {}),
+          ...(directBody ? { directBody } : {}),
+          ...(collapseId ? { collapseId } : {}),
+          queuedAt: now,
+          notBefore: waiting?.notBefore ?? now,
+          attempts: waiting?.attempts ?? 0,
+        });
       }
       this.kick();
     } catch (error) {
@@ -509,7 +606,14 @@ export class PhonePush {
     const body = { v: PHONE_PUSH_WIRE_VERSION, token: device.token, ...(device.pairing ? { pairing: device.pairing } : {}), ...(job.collapseId ? { collapseId: job.collapseId } : {}), notification: job.push };
     const apns = device.platform === "apns" ? this.options.apns?.() : null;
     if (apns) {
-      const outcome = await this.apnsClient.sendAlert(apns, device.environment, body);
+      const rich = apns.includePreview;
+      const directBody = {
+        ...body,
+        notification: rich && job.directTitle ? { ...job.push, title: job.directTitle } : job.push,
+        ...(rich && job.directSubtitle ? { alertSubtitle: job.directSubtitle } : {}),
+        ...(rich && job.directBody ? { alertBody: job.directBody } : {}),
+      };
+      const outcome = await this.apnsClient.sendAlert(apns, device.environment, directBody);
       if (outcome.kind === "sent") {
         this.sent.set(job.key, [...recent, now]);
         this.lastBySlot.set(job.slot, now);
@@ -574,13 +678,26 @@ export class PhonePush {
       return { ok: false, status: 409, error: "No paired iPhone has registered for notifications yet. Open MausBot on your paired iPhone once so it registers its device token." };
     }
     const sample = target ?? { botId: "mausbot", botName: "MausBot", threadId: "test_notification" };
+    const botName = clip(sample.botName, PUSH_NAME_MAX) || "MausBot";
+    const threadId = PUSH_ID.test(sample.threadId) ? sample.threadId : "test_notification";
+    const language = conversationLanguage(threadId) ?? "en";
     const push: PhonePushNotification = {
       kind: "done",
-      title: `${clip(sample.botName, PUSH_NAME_MAX) || "MausBot"} test notification`,
+      title: serverLine(language, "server.notify.done", { who: botName }),
       botId: PUSH_ID.test(sample.botId) ? sample.botId : "mausbot",
-      botName: clip(sample.botName, PUSH_NAME_MAX) || "MausBot",
-      threadId: PUSH_ID.test(sample.threadId) ? sample.threadId : "test_notification",
+      botName,
+      threadId,
     };
+    const subtitle = apns.includePreview
+      ? cleanSubtitle(this.options.threadTitle?.(threadId, push.botId), botName) ?? (language.startsWith("zh") ? "本機 APNs 直連測試" : "Direct APNs test")
+      : undefined;
+    const previewBody = apns.includePreview
+      ? (language === "zh-tw"
+        ? "推播內容預覽與動態島即時進度已成功啟用。"
+        : language.startsWith("zh")
+          ? "推送内容预览与灵动岛实时进度已成功启用。"
+          : "Rich notification previews and Dynamic Island live updates are active.")
+      : undefined;
     let sent = 0;
     const reasons: string[] = [];
     for (const device of devices) {
@@ -589,6 +706,8 @@ export class PhonePush {
         token: device.token,
         ...(device.pairing ? { pairing: device.pairing } : {}),
         notification: push,
+        ...(subtitle ? { alertSubtitle: subtitle } : {}),
+        ...(previewBody ? { alertBody: previewBody } : {}),
       });
       if (outcome.kind === "sent") {
         sent += 1;

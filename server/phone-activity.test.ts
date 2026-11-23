@@ -1,8 +1,11 @@
+import { generateKeyPairSync } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
+import { resolveApnsConfig } from "./apns-config.ts";
+import { ApnsDirectClient, type ApnsRawRequest } from "./apns-direct.ts";
 import { activityRegistrationSchema, FALLBACK_VISUAL, PhoneActivity } from "./phone-activity.ts";
 import { PhonePush } from "./phone-push.ts";
 
@@ -227,5 +230,175 @@ describe("pushing a bot's activity while the app is closed", () => {
     expect(earlier).toHaveLength(2);
     for (const body of earlier) expect(["version", "ask", "status", "waiting"].some((field) => field in body)).toBe(false);
     expect(activityRegistrationSchema.safeParse({ scheme: "openmausbot", headlines: HEADLINES, statuses: { ...statuses, working: "Work\ning" } }).success).toBe(false);
+  });
+
+  it("drives the full Direct APNs Dynamic Island lifecycle: debounced working start, throttled tool progress, needsYou pills, and idle checkmark linger", async () => {
+    const { privateKey } = generateKeyPairSync("ec", { namedCurve: "prime256v1" });
+    const pem = String(privateKey.export({ type: "pkcs8", format: "pem" })).trim();
+    const apnsCalls: ApnsRawRequest[] = [];
+    let clock = 2_000_000;
+    const apnsClient = new ApnsDirectClient({
+      now: () => clock,
+      transport: async (req) => {
+        apnsCalls.push(req);
+        return { status: 200, apnsId: "apns-island", body: "" };
+      },
+    });
+    const push = new PhonePush({
+      dataDir,
+      access: () => null,
+      apns: () => resolveApnsConfig({
+        teamId: "TEAM123456",
+        keyId: "KEY1234567",
+        bundleId: "com.example.mausbot",
+        privateKey: pem,
+        environment: "sandbox",
+        includePreview: true,
+      }),
+      apnsClient,
+      enabled: () => true,
+      live: () => false,
+      room: () => undefined,
+      threadTitle: () => "修復 iOS 動態島",
+      now: () => clock,
+      log: () => {},
+    });
+    const openAsks = new Set<string>();
+    const bots = new Map([["bot_1", { name: "Scout", busy: false, threadId: "th_1" }]]);
+    const activity = new PhoneActivity({
+      dataDir,
+      push,
+      hasOpenAsk: (botId) => openAsks.has(botId),
+      bot: (botId) => bots.get(botId),
+      botOfThread: () => "bot_1",
+      now: () => clock,
+      log: () => {},
+      timers: { set: () => ({}), clear: () => {} },
+    });
+
+    await push.register(IPHONE, { platform: "apns", token: "ab".repeat(32), environment: "sandbox" });
+    await activity.register(IPHONE, activityRegistrationSchema.parse({
+      scheme: "openmausbot",
+      headlines: { needsYou: "{name} 需要你處理", working: "{name} 正在處理" },
+      statuses: {
+        working: "處理中",
+        needsYou: { approval: "等待你核准", question: "有個問題想問你", signIn: "需要你登入", other: "需要你處理" },
+      },
+      startToken: START,
+      visuals: { bot_1: VISUAL },
+    }));
+
+    // 1. Fast turn (< 1.5s) never starts a Dynamic Island session.
+    bots.set("bot_1", { name: "Scout", busy: true, threadId: "th_1" });
+    activity.offer(runtime("turn.started"), everyone);
+    await activity.flushNow();
+    expect(apnsCalls).toHaveLength(0);
+    clock += 800;
+    bots.set("bot_1", { name: "Scout", busy: false, threadId: "th_1" });
+    activity.offer(runtime("turn.completed"), everyone);
+    await activity.flushNow();
+    clock += 2_000;
+    await activity.flushNow();
+    expect(apnsCalls).toHaveLength(0);
+
+    // 2. Real turn (> 1.5s) push-starts Dynamic Island silently with task context.
+    bots.set("bot_1", { name: "Scout", busy: true, threadId: "th_1" });
+    activity.offer(runtime("turn.started"), everyone);
+    await activity.flushNow();
+    clock += 1_600;
+    await activity.flushNow();
+    expect(apnsCalls).toHaveLength(1);
+    expect(apnsCalls[0]!.path).toBe(`/3/device/${START}`);
+    const startPayload = JSON.parse(apnsCalls[0]!.body);
+    expect(startPayload.aps.event).toBe("start");
+    expect("sound" in (startPayload.aps.alert ?? {})).toBe(false);
+    expect(JSON.parse(startPayload.aps["content-state"].props)).toMatchObject({
+      kind: "working",
+      mood: "working",
+      status: "處理中 · 修復 iOS 動態島",
+    });
+
+    // 3. iPhone registers its per-activity token and receives live tool step progress (throttled to 6s).
+    activity.offer({
+      kind: "runtime",
+      event: { type: "turn.progress", threadId: "th_1", activity: "command", target: "pnpm test" },
+    }, everyone);
+    await activity.flushNow();
+    await activity.register(IPHONE, activityRegistrationSchema.parse({
+      scheme: "openmausbot",
+      headlines: { needsYou: "{name} 需要你處理", working: "{name} 正在處理" },
+      statuses: {
+        working: "處理中",
+        needsYou: { approval: "等待你核准", question: "有個問題想問你", signIn: "需要你登入", other: "需要你處理" },
+      },
+      startToken: START,
+      activities: [{ botId: "bot_1", token: ACT }],
+      visuals: { bot_1: VISUAL },
+    }));
+    await activity.flushNow();
+    expect(apnsCalls).toHaveLength(2);
+    expect(JSON.parse(JSON.parse(apnsCalls[1]!.body).aps["content-state"].props)).toMatchObject({
+      kind: "working",
+      status: "執行 · pnpm test",
+    });
+
+    // Immediate next tool progress within 6s is throttled, then flushed once 6s elapses.
+    clock += 1_000;
+    activity.offer({
+      kind: "runtime",
+      event: { type: "item.started", threadId: "th_1", itemType: "tool", step: { activity: "edit", target: "server/phone-activity.ts" } },
+    }, everyone);
+    await activity.flushNow();
+    expect(apnsCalls).toHaveLength(2);
+    clock += 5_500;
+    await activity.flushNow();
+    expect(apnsCalls).toHaveLength(3);
+    expect(JSON.parse(JSON.parse(apnsCalls[2]!.body).aps["content-state"].props)).toMatchObject({
+      kind: "working",
+      status: "編輯 · phone-activity.ts",
+    });
+
+    // 4. Approval ask transitions to needsYou with detail + 2 localized deep-link capsule pills.
+    openAsks.add("bot_1");
+    activity.offer({
+      kind: "notify",
+      notification: { kind: "approval", botId: "bot_1", botName: "Scout", threadId: "th_1", title: "Approve", body: "rm -rf dist" },
+    }, everyone);
+    await activity.flushNow();
+    expect(apnsCalls).toHaveLength(4);
+    const askProps = JSON.parse(JSON.parse(apnsCalls[3]!.body).aps["content-state"].props);
+    expect(askProps).toMatchObject({
+      kind: "needsYou",
+      mood: "needsYou",
+      status: "等待你核准 · rm -rf dist",
+      waiting: 1,
+    });
+    expect(askProps.answers).toEqual([
+      { label: "查看對話", link: "openmausbot://chat/th_1?from=island", refusal: true },
+      { label: "前往核准", link: "openmausbot://chat/th_1?focus=approval", refusal: false },
+    ]);
+
+    // 5. Turn completion shows idle checkmark (`✓`) with reply summary for 45s, then ends cleanly.
+    openAsks.delete("bot_1");
+    bots.set("bot_1", { name: "Scout", busy: false, threadId: "th_1" });
+    activity.offer({
+      kind: "notify",
+      notification: { kind: "done", botId: "bot_1", botName: "Scout", threadId: "th_1", title: "Scout 已完成", body: "全部測試皆已通過" },
+    }, everyone);
+    await activity.flushNow();
+    expect(apnsCalls).toHaveLength(5);
+    const idlePayload = JSON.parse(apnsCalls[4]!.body);
+    expect(idlePayload.aps.event).toBe("update");
+    expect(JSON.parse(idlePayload.aps["content-state"].props)).toMatchObject({
+      kind: "idle",
+      mood: "idle",
+      status: "已完成 · 全部測試皆已通過",
+    });
+
+    clock += 45_500;
+    await activity.flushNow();
+    expect(apnsCalls).toHaveLength(6);
+    expect(JSON.parse(apnsCalls[5]!.body).aps.event).toBe("end");
+    expect(activity.registration(IPHONE)?.activities).toEqual([]);
   });
 });

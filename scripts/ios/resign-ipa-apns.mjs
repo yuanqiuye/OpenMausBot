@@ -229,8 +229,10 @@ export function patchExtractedAppBundle(appDir, options) {
   // iOS Keychain (-34018 errSecMissingEntitlement) occurs unless these match the re-signing Team ID + App Group.
   info.OpenMausKeychainAccessGroup = `${teamId}.${appGroup}`;
   info.OpenMausLegacyKeychainAccessGroup = `${teamId}.${bundleId}`;
-  // Enables ActivityKit remote push tokens inside ExpoWidgets.LiveActivityFactory.
+  // Enables ActivityKit remote push tokens and frequent APNs updates inside ExpoWidgets.LiveActivityFactory.
   info.ExpoWidgets_EnablePushNotifications = true;
+  info.NSSupportsLiveActivities = true;
+  info.NSSupportsLiveActivitiesFrequentUpdates = true;
   const bgModes = Array.isArray(info.UIBackgroundModes) ? [...info.UIBackgroundModes] : [];
   if (!bgModes.includes("remote-notification")) bgModes.push("remote-notification");
   info.UIBackgroundModes = bgModes;
@@ -245,6 +247,8 @@ export function patchExtractedAppBundle(appDir, options) {
     bundleIdentifier: bundleId,
     infoPlist: {
       ...appConfig.ios?.infoPlist,
+      NSSupportsLiveActivities: true,
+      NSSupportsLiveActivitiesFrequentUpdates: true,
       OpenMausAppGroup: appGroup,
       OpenMausKeychainAccessGroup: `${teamId}.${appGroup}`,
       OpenMausLegacyKeychainAccessGroup: `${teamId}.${bundleId}`,

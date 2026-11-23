@@ -22,16 +22,34 @@ import {
   type PhoneActivityRegistration,
   type PushRelayActivityRequest,
 } from "../shared/phone-push.ts";
+import type { DirectApnsActivityRequest, DirectApnsActivityState } from "./apns-direct.ts";
 import { writeFileAtomic } from "./atomic.ts";
+import {
+  buildNeedsYouAnswers,
+  clipActivityStatus,
+  detectPhoneLanguage,
+  formatCompletionStatus,
+  formatProgressStep,
+} from "./phone-activity-copy.ts";
 import { PUSH_DEVICE_KEY, type PhonePush } from "./phone-push.ts";
 
 export const PHONE_ACTIVITY_FILE = "push-activity.json";
 export const MAX_ACTIVITY_PHONES = 50;
 export const MAX_ACTIVITIES = 10;
 export const MAX_VISUALS = 60;
+export const DEFAULT_WORKING_START_DELAY_MS = 1_500;
+export const DEFAULT_ACTIVITY_PROGRESS_MS = 6_000;
+export const DEFAULT_COMPLETION_LINGER_MS = 45_000;
+const STARTING_DEDUP_MS = 30_000;
 const HEADLINE_MAX = 120;
 /** A notification kind that means a bot needs the person, as the ask the phone's content state names. */
-const ASK_OF_KIND: ReadonlyMap<string, ActivityAsk> = new Map([["approval", "approval"], ["question", "question"], ["sign-in", "signIn"]]);
+const ASK_OF_KIND: ReadonlyMap<string, ActivityAsk> = new Map([
+  ["approval", "approval"],
+  ["question", "question"],
+  ["sign-in", "signIn"],
+  ["secret", "other"],
+]);
+const DONE_KINDS: ReadonlySet<string> = new Set(["done", "turn-failed", "routine-failed", "incident"]);
 
 const hex = z.string().regex(/^#[0-9A-Fa-f]{6}$/);
 const visualSchema = z.object({ color: hex, gradient: z.array(hex).min(1).max(4), body: z.string().regex(/^[a-z][a-z0-9-]{0,39}$/) }).strict();
@@ -80,11 +98,28 @@ export interface PhoneActivityOptions {
   log?: (line: string) => void;
   /** Frames for one bot gather this long before its state is read again. */
   settleMs?: number;
+  workingStartDelayMs?: number;
+  progressIntervalMs?: number;
+  lingerMs?: number;
   timers?: { set(run: () => void, ms: number): unknown; clear(handle: unknown): void };
 }
 
 /** The runtime events that change whether a bot is working or waiting on the person. */
 const STATE_EVENTS: ReadonlySet<string> = new Set(["turn.started", "turn.completed", "turn.retrying", "turn.wait_started", "turn.wait_ended", "request.opened", "request.resolved", "session.exited"]);
+const PROGRESS_EVENTS: ReadonlySet<string> = new Set(["turn.progress", "item.started"]);
+
+interface ScheduledTimer {
+  due: number;
+  handle: unknown;
+  run: () => void;
+}
+
+interface DoneSummary {
+  kind: string;
+  text: string;
+  threadId: string;
+  at: number;
+}
 
 export type ActivityOutcome = { key: string; botId: string; event: ActivityEvent; via: "apns" | "fcm"; result: "sent" | "dropped" | "failed" };
 
@@ -118,12 +153,26 @@ export class PhoneActivity {
   private readonly reach = new Map<string, (key: string) => boolean>();
   private readonly askThread = new Map<string, string>();
   private readonly askKind = new Map<string, ActivityAsk>();
+  private readonly askSummary = new Map<string, string>();
+  private readonly stepRaw = new Map<string, { activity: string; target?: string; file?: string; tool?: string }>();
+  private readonly doneSummary = new Map<string, DoneSummary>();
+  private readonly startingUntil = new Map<string, number>();
+  private readonly lastProgressAt = new Map<string, number>();
+  private readonly lastStatusSent = new Map<string, string>();
+  private readonly workingStartTimers = new Map<string, ScheduledTimer>();
+  private readonly progressTimers = new Map<string, ScheduledTimer>();
+  private readonly lingerTimers = new Map<string, ScheduledTimer>();
+  private readonly timers: NonNullable<PhoneActivityOptions["timers"]>;
 
   constructor(options: PhoneActivityOptions) {
     this.options = options;
     this.file = join(options.dataDir, PHONE_ACTIVITY_FILE);
     this.now = options.now ?? Date.now;
     this.log = options.log ?? ((line) => console.log(line));
+    this.timers = options.timers ?? {
+      set: (run: () => void, ms: number) => setTimeout(run, ms).unref(),
+      clear: (handle: unknown) => clearTimeout(handle as ReturnType<typeof setTimeout>),
+    };
     let raw: unknown;
     try {
       raw = JSON.parse(readFileSync(this.file, "utf8"));
@@ -181,6 +230,32 @@ export class PhoneActivity {
     const listed = new Set((input.activities ?? []).map(({ botId }) => botId));
     const shown = this.shown.get(key);
     if (shown) for (const botId of shown.keys()) if (!listed.has(botId) && !input.ongoing) shown.delete(botId);
+
+    if (this.hasDirectApns() && !this.options.push.isLive(key)) {
+      const prevTokens = new Map((previous?.registration.activities ?? []).map(({ botId, token }) => [botId, token]));
+      const storedPhone = this.phones.find((candidate) => candidate.key === key);
+      if (storedPhone) {
+        for (const { botId, token } of input.activities ?? []) {
+          const slotKey = `${key}|${botId}`;
+          const wasStarting = (this.startingUntil.get(slotKey) ?? 0) > this.now();
+          this.startingUntil.delete(slotKey);
+          this.clearSlotTimer(this.workingStartTimers, slotKey);
+          if (prevTokens.get(botId) === token) continue;
+          const reaches = this.reach.get(botId);
+          if (reaches && !reaches(key)) continue;
+          const current = this.bots.get(botId);
+          const wanted = current && (input.kinds ?? ["needsYou", "working"]).includes(current.kind) ? current.kind : undefined;
+          if (wanted) {
+            const nextShown = this.shown.get(key) ?? new Map<string, ActivityKind>();
+            this.shown.set(key, nextShown);
+            nextShown.set(botId, wanted);
+            this.enqueue(storedPhone, botId, wanted, wanted);
+          } else if (wasStarting || (this.doneSummary.get(botId)?.at ?? 0) > this.now() - 60_000) {
+            this.enqueueCompletion(storedPhone, botId);
+          }
+        }
+      }
+    }
     return "saved";
   }
 
@@ -189,6 +264,7 @@ export class PhoneActivity {
     if (!previous) return;
     this.phones = this.phones.filter((phone) => phone.key !== key);
     this.shown.delete(key);
+    this.clearKeyTimers(key);
     this.persist();
     const tokens = [previous.registration.startToken, ...(previous.registration.activities ?? []).map(({ token }) => token)].filter((token): token is string => Boolean(token));
     await Promise.all(tokens.map((token) => this.options.push.call(PHONE_PUSH_RELAY_PATHS.unregister, { v: PHONE_PUSH_WIRE_VERSION, platform: "apns", token })));
@@ -215,8 +291,7 @@ export class PhoneActivity {
       if (!botId) return;
       this.reach.set(botId, reaches);
       if (this.pending.has(botId)) return;
-      const timers = this.options.timers ?? { set: (run: () => void, ms: number) => setTimeout(run, ms).unref(), clear: (handle: unknown) => clearTimeout(handle as ReturnType<typeof setTimeout>) };
-      this.pending.set(botId, timers.set(() => {
+      this.pending.set(botId, this.timers.set(() => {
         this.pending.delete(botId);
         this.settle(botId);
       }, this.options.settleMs ?? 250));
@@ -225,16 +300,75 @@ export class PhoneActivity {
     }
   }
 
+  private hasDirectApns(): boolean {
+    return this.options.push.hasDirectApns?.() === true;
+  }
+
+  private includePreview(): boolean {
+    return this.hasDirectApns() && this.options.push.includePreview?.() === true;
+  }
+
+  private setSlotTimer(map: Map<string, ScheduledTimer>, slotKey: string, delayMs: number, run: () => void): void {
+    this.clearSlotTimer(map, slotKey);
+    const due = this.now() + Math.max(delayMs, 0);
+    const handle = this.timers.set(() => {
+      map.delete(slotKey);
+      run();
+    }, Math.max(delayMs, 0));
+    map.set(slotKey, { due, handle, run });
+  }
+
+  private clearSlotTimer(map: Map<string, ScheduledTimer>, slotKey: string): void {
+    const existing = map.get(slotKey);
+    if (!existing) return;
+    this.timers.clear(existing.handle);
+    map.delete(slotKey);
+  }
+
+  private clearKeyTimers(key: string): void {
+    const prefix = `${key}|`;
+    for (const map of [this.workingStartTimers, this.progressTimers, this.lingerTimers]) {
+      for (const slotKey of map.keys()) {
+        if (slotKey.startsWith(prefix)) this.clearSlotTimer(map, slotKey);
+      }
+    }
+    for (const slotKey of this.startingUntil.keys()) {
+      if (slotKey.startsWith(prefix)) this.startingUntil.delete(slotKey);
+    }
+    for (const slotKey of this.lastProgressAt.keys()) {
+      if (slotKey.startsWith(prefix)) this.lastProgressAt.delete(slotKey);
+    }
+    for (const slotKey of this.lastStatusSent.keys()) {
+      if (slotKey.startsWith(prefix)) this.lastStatusSent.delete(slotKey);
+    }
+  }
+
   /** The bot a frame is about, noting the conversation an ask came from; null for a frame that changes no activity. */
   private botOf(payload: Record<string, unknown>): string | null {
     if (payload.kind === "notify") {
       const notification = payload.notification as Record<string, unknown> | undefined;
       const botId = notification?.botId, threadId = notification?.threadId, kind = notification?.kind;
-      const ask = typeof kind === "string" ? ASK_OF_KIND.get(kind) : undefined;
-      if (typeof botId !== "string" || !ask || !PUSH_ID.test(botId)) return null;
-      if (typeof threadId === "string") this.askThread.set(botId, threadId);
-      this.askKind.set(botId, ask);
-      return botId;
+      if (typeof botId !== "string" || typeof kind !== "string" || !PUSH_ID.test(botId)) return null;
+      const ask = ASK_OF_KIND.get(kind);
+      if (ask) {
+        if (typeof threadId === "string") this.askThread.set(botId, threadId);
+        this.askKind.set(botId, ask);
+        const rawBody = typeof notification?.body === "string" ? notification.body : "";
+        const cleaned = clipActivityStatus(rawBody, 56);
+        if (cleaned) this.askSummary.set(botId, cleaned);
+        return botId;
+      }
+      if (this.hasDirectApns() && DONE_KINDS.has(kind)) {
+        const rawBody = typeof notification?.body === "string" ? notification.body : "";
+        this.doneSummary.set(botId, {
+          kind,
+          text: clipActivityStatus(rawBody, 56),
+          threadId: typeof threadId === "string" ? threadId : (this.seen.get(botId)?.threadId ?? botId),
+          at: this.now(),
+        });
+        return botId;
+      }
+      return null;
     }
     if (payload.kind === "bot") {
       const botId = (payload.bot as Record<string, unknown> | undefined)?.id;
@@ -242,9 +376,70 @@ export class PhoneActivity {
     }
     if (payload.kind === "runtime") {
       const event = payload.event as Record<string, unknown> | undefined;
-      if (typeof event?.type !== "string" || !STATE_EVENTS.has(event.type) || typeof event.threadId !== "string") return null;
+      if (typeof event?.type !== "string" || typeof event.threadId !== "string") return null;
+      const isState = STATE_EVENTS.has(event.type);
+      const isProgress = this.includePreview() && PROGRESS_EVENTS.has(event.type);
+      if (!isState && !isProgress) return null;
       const botId = this.options.botOfThread(event.threadId);
-      return botId && PUSH_ID.test(botId) ? botId : null;
+      if (!botId || !PUSH_ID.test(botId)) return null;
+      if (event.type === "turn.started") {
+        this.stepRaw.delete(botId);
+        this.doneSummary.delete(botId);
+      } else if (event.type === "turn.retrying") {
+        this.stepRaw.set(botId, { activity: "retrying" });
+      } else if (event.type === "turn.wait_started") {
+        this.stepRaw.set(botId, { activity: "waiting" });
+      } else if (event.type === "turn.wait_ended") {
+        if (this.stepRaw.get(botId)?.activity === "waiting") this.stepRaw.delete(botId);
+      } else if (event.type === "request.opened") {
+        if (typeof event.summary === "string" && !this.askSummary.has(botId)) {
+          const cleaned = clipActivityStatus(event.summary, 56);
+          if (cleaned) this.askSummary.set(botId, cleaned);
+        }
+        if (typeof event.requestKind === "string" && !this.askKind.has(botId)) {
+          const mapped: ActivityAsk = event.requestKind === "approval"
+            ? "approval"
+            : event.requestKind === "user_input"
+              ? "question"
+              : event.requestKind === "auth"
+                ? "signIn"
+                : "other";
+          this.askKind.set(botId, mapped);
+        }
+      } else if (isProgress) {
+        const extracted = this.extractStep(event);
+        if (!extracted) return null;
+        const prev = this.stepRaw.get(botId);
+        if (prev && prev.activity === extracted.activity && prev.target === extracted.target && prev.file === extracted.file && prev.tool === extracted.tool) {
+          return null;
+        }
+        this.stepRaw.set(botId, extracted);
+      }
+      return botId;
+    }
+    return null;
+  }
+
+  private extractStep(event: Record<string, unknown>): { activity: string; target?: string; file?: string; tool?: string } | null {
+    if (event.type === "turn.progress" && typeof event.activity === "string") {
+      return {
+        activity: event.activity,
+        ...(typeof event.target === "string" && event.target ? { target: event.target } : {}),
+        ...(typeof event.file === "string" && event.file ? { file: event.file } : {}),
+        ...(typeof event.tool === "string" && event.tool ? { tool: event.tool } : {}),
+      };
+    }
+    if (event.type === "item.started" && event.itemType === "tool") {
+      const step = event.step && typeof event.step === "object" ? event.step as Record<string, unknown> : null;
+      if (step && typeof step.activity === "string") {
+        return {
+          activity: step.activity,
+          ...(typeof step.target === "string" && step.target ? { target: step.target } : {}),
+        };
+      }
+      if (typeof event.title === "string" && event.title.trim()) {
+        return { activity: "tool", target: event.title.trim() };
+      }
     }
     return null;
   }
@@ -263,13 +458,18 @@ export class PhoneActivity {
       if (kind !== "needsYou") {
         this.askThread.delete(botId);
         this.askKind.delete(botId);
+        this.askSummary.delete(botId);
       }
+      if (!kind) this.stepRaw.delete(botId);
+      const directApns = this.hasDirectApns();
       const reaches = this.reach.get(botId) ?? (() => false);
       for (const phone of this.phones) {
+        const slotKey = `${phone.key}|${botId}`;
         if (this.options.push.isLive(phone.key)) {
           // Its app draws its own activities while connected; after, the server starts from nothing.
           this.shown.delete(phone.key);
           this.told.delete(phone.key);
+          this.clearKeyTimers(phone.key);
           continue;
         }
         if (!reaches(phone.key)) continue;
@@ -281,10 +481,36 @@ export class PhoneActivity {
         told.add(botId);
         const wanted = kind && (phone.registration.kinds ?? ["needsYou", "working"]).includes(kind) ? kind : undefined;
         const was = shown.get(botId);
+        const running = phone.registration.activities?.find((entry) => entry.botId === botId);
+
+        if (wanted) {
+          this.clearSlotTimer(this.lingerTimers, slotKey);
+        } else {
+          this.clearSlotTimer(this.workingStartTimers, slotKey);
+          this.clearSlotTimer(this.progressTimers, slotKey);
+        }
+
+        if (wanted === "working" && !was && directApns && !running && phone.registration.startToken && !phone.registration.ongoing) {
+          if (!this.workingStartTimers.has(slotKey) && now >= (this.startingUntil.get(slotKey) ?? 0)) {
+            const delay = this.options.workingStartDelayMs ?? DEFAULT_WORKING_START_DELAY_MS;
+            this.setSlotTimer(this.workingStartTimers, slotKey, delay, () => this.fireWorkingStart(phone.key, botId));
+          }
+          continue;
+        }
+
+        if (wanted === "needsYou") {
+          this.clearSlotTimer(this.workingStartTimers, slotKey);
+          this.clearSlotTimer(this.progressTimers, slotKey);
+        }
+
         if (wanted === was) {
+          if (wanted === "working" && directApns && running && this.includePreview()) {
+            this.maybePushProgress(phone, botId, now);
+            continue;
+          }
           // The app may have drawn this bot before it went quiet: end what it left, once.
-          const drawn = phone.registration.ongoing === true || phone.registration.activities?.some((entry) => entry.botId === botId) === true;
-          if (firstNews && !wanted && drawn) this.enqueue(phone, botId, undefined, "working");
+          const drawn = phone.registration.ongoing === true || Boolean(running);
+          if (firstNews && !wanted && drawn) this.enqueue(phone, botId, undefined, "working", true);
           continue;
         }
         if (wanted) shown.set(botId, wanted);
@@ -296,15 +522,74 @@ export class PhoneActivity {
     }
   }
 
-  /** Runs every settle that is waiting now, then waits for the sends. */
-  async flushNow(): Promise<void> {
-    const timers = this.options.timers;
-    for (const [botId, handle] of this.pending) {
-      timers?.clear(handle);
-      this.pending.delete(botId);
-      this.settle(botId);
+  private fireWorkingStart(key: string, botId: string): void {
+    const phone = this.phones.find((candidate) => candidate.key === key);
+    const state = this.bots.get(botId);
+    if (!phone || !state || state.kind !== "working" || this.options.push.status() !== "on" || this.options.push.isLive(key)) return;
+    const reaches = this.reach.get(botId);
+    if (reaches && !reaches(key)) return;
+    if (!(phone.registration.kinds ?? ["needsYou", "working"]).includes("working")) return;
+    const running = phone.registration.activities?.find((entry) => entry.botId === botId);
+    const slotKey = `${key}|${botId}`;
+    const now = this.now();
+    if (!running && !phone.registration.startToken) return;
+    if (!running && now < (this.startingUntil.get(slotKey) ?? 0)) return;
+    const shown = this.shown.get(key) ?? new Map<string, ActivityKind>();
+    this.shown.set(key, shown);
+    shown.set(botId, "working");
+    this.enqueue(phone, botId, "working", undefined);
+  }
+
+  private maybePushProgress(phone: Stored, botId: string, now: number): void {
+    const state = this.bots.get(botId);
+    if (!state || state.kind !== "working") return;
+    const slotKey = `${phone.key}|${botId}`;
+    const nextActivity = this.activityBody(phone, botId, "working", state, botId);
+    const desired = nextActivity.status ?? nextActivity.headline;
+    if (!desired || desired === this.lastStatusSent.get(slotKey)) return;
+    const interval = this.options.progressIntervalMs ?? DEFAULT_ACTIVITY_PROGRESS_MS;
+    const lastAt = this.lastProgressAt.get(slotKey) ?? 0;
+    const elapsed = now - lastAt;
+    if (elapsed >= interval) {
+      this.clearSlotTimer(this.progressTimers, slotKey);
+      this.enqueue(phone, botId, "working", "working");
+      return;
     }
-    await this.queue;
+    if (!this.progressTimers.has(slotKey)) {
+      this.setSlotTimer(this.progressTimers, slotKey, interval - elapsed, () => {
+        const freshPhone = this.phones.find((candidate) => candidate.key === phone.key);
+        const freshState = this.bots.get(botId);
+        if (!freshPhone || !freshState || freshState.kind !== "working" || this.options.push.isLive(phone.key)) return;
+        if (!freshPhone.registration.activities?.some((entry) => entry.botId === botId)) return;
+        this.enqueue(freshPhone, botId, "working", "working");
+      });
+    }
+  }
+
+  /** Runs every settle and due timer that is waiting now, then waits for the sends. */
+  async flushNow(): Promise<void> {
+    for (;;) {
+      let progressed = false;
+      for (const [botId, handle] of Array.from(this.pending.entries())) {
+        this.timers.clear(handle);
+        this.pending.delete(botId);
+        this.settle(botId);
+        progressed = true;
+      }
+      const now = this.now();
+      for (const map of [this.workingStartTimers, this.progressTimers, this.lingerTimers]) {
+        for (const [slotKey, entry] of Array.from(map.entries())) {
+          if (entry.due <= now) {
+            this.timers.clear(entry.handle);
+            map.delete(slotKey);
+            entry.run();
+            progressed = true;
+          }
+        }
+      }
+      await this.queue;
+      if (!progressed) break;
+    }
   }
 
   private remember(botId: string, name: string, threadId: string): void {
@@ -316,66 +601,232 @@ export class PhoneActivity {
     }
   }
 
-  private enqueue(phone: Stored, botId: string, wanted: ActivityKind | undefined, was: ActivityKind | undefined): void {
+  private enqueue(phone: Stored, botId: string, wanted: ActivityKind | undefined, was: ActivityKind | undefined, forceImmediateEnd = false): void {
     const state = this.bots.get(botId);
-    this.queue = this.queue.then(() => this.send(phone, botId, wanted, was, state)).catch((error: unknown) => {
+    this.queue = this.queue.then(() => this.send(phone, botId, wanted, was, state, forceImmediateEnd)).catch((error: unknown) => {
       this.log(`[phone-activity] could not push: ${error instanceof Error ? error.message : String(error)}`);
     });
   }
 
-  private activityBody(phone: Stored, botId: string, kind: ActivityKind, state: BotState | undefined, fallbackName: string): PushRelayActivityRequest["activity"] {
+  private enqueueCompletion(phone: Stored, botId: string): void {
+    this.queue = this.queue.then(() => this.sendCompletionLinger(phone, botId)).catch((error: unknown) => {
+      this.log(`[phone-activity] could not push completion: ${error instanceof Error ? error.message : String(error)}`);
+    });
+  }
+
+  private activityBody(phone: Stored, botId: string, kind: ActivityKind, state: BotState | undefined, fallbackName: string): DirectApnsActivityState {
     const registration = phone.registration;
     const visual = registration.visuals?.[botId] ?? registration.fallbackVisual ?? FALLBACK_VISUAL;
     const known = state ?? this.seen.get(botId);
     const name = clipName(known?.name ?? fallbackName);
+    const threadId = known?.threadId ?? botId;
     const statuses = registration.statuses;
     const ask: ActivityAsk = kind === "needsYou" ? this.askKind.get(botId) ?? "other" : "other";
+    const directApns = this.hasDirectApns();
+    const preview = this.includePreview();
+    const language = directApns ? detectPhoneLanguage(registration, threadId) : "en";
+
+    let statusText = statuses ? (kind === "working" ? statuses.working : statuses.needsYou[ask]) : undefined;
+    let lineText: string | undefined;
+    if (preview) {
+      if (kind === "working") {
+        const rawStep = this.stepRaw.get(botId);
+        const taskTitle = clipActivityStatus(this.options.push.threadTitleOf?.(threadId, botId) ?? "", 44);
+        const richStep = rawStep ? formatProgressStep(language, rawStep) : "";
+        if (richStep) {
+          statusText = statuses ? richStep : undefined;
+          lineText = richStep;
+        } else if (taskTitle && taskTitle.toLowerCase() !== "new thread" && taskTitle.toLowerCase() !== "new task" && taskTitle !== name) {
+          const base = statuses?.working ?? "";
+          statusText = statuses ? clipActivityStatus(base ? `${base} · ${taskTitle}` : taskTitle) : undefined;
+          lineText = taskTitle;
+        }
+      } else if (kind === "needsYou") {
+        const detail = this.askSummary.get(botId);
+        if (detail) {
+          const base = statuses?.needsYou[ask] ?? "";
+          statusText = statuses ? clipActivityStatus(base ? `${base} · ${detail}` : detail) : undefined;
+          lineText = detail;
+        }
+      }
+    }
+
+    const answers = directApns && statuses && kind === "needsYou"
+      ? buildNeedsYouAnswers(language, registration.scheme, threadId, ask)
+      : undefined;
+
     return {
       botId,
       botName: name,
       kind,
       headline: headlineFor(registration.headlines[kind], name),
       since: state?.since ?? this.now(),
-      link: `${registration.scheme}://chat/${encodeURIComponent(known?.threadId ?? botId)}`,
+      link: `${registration.scheme}://chat/${encodeURIComponent(threadId)}`,
       ...visual,
+      ...(lineText && !statuses ? { line: lineText } : {}),
+      ...(answers ? { answers } : {}),
       // Content state version 1 only for a phone that registered its words for it.
       ...(statuses ? {
         version: 1 as const,
         ask,
-        status: kind === "working" ? statuses.working : statuses.needsYou[ask],
+        status: statusText ?? (kind === "working" ? statuses.working : statuses.needsYou[ask]),
         waiting: [...this.bots.values()].filter((bot) => bot.kind === "needsYou").length,
       } : {}),
     };
   }
 
-  private async send(phone: Stored, botId: string, wanted: ActivityKind | undefined, was: ActivityKind | undefined, state: BotState | undefined): Promise<ActivityOutcome[]> {
-    const outcomes: ActivityOutcome[] = [];
+  private completionActivityBody(phone: Stored, botId: string): DirectApnsActivityState {
     const registration = phone.registration;
+    const visual = registration.visuals?.[botId] ?? registration.fallbackVisual ?? FALLBACK_VISUAL;
+    const done = this.doneSummary.get(botId);
+    const known = this.seen.get(botId);
+    const name = clipName(known?.name ?? botId);
+    const threadId = done?.threadId ?? known?.threadId ?? botId;
+    const language = detectPhoneLanguage(registration, threadId);
+    const { headline, status } = formatCompletionStatus(language, name, done, this.includePreview());
+    const statuses = registration.statuses;
+    return {
+      botId,
+      botName: name,
+      kind: "idle",
+      headline,
+      since: this.now(),
+      link: `${registration.scheme}://chat/${encodeURIComponent(threadId)}`,
+      ...visual,
+      ...(!statuses ? { line: status } : {}),
+      ...(statuses ? {
+        version: 1 as const,
+        ask: "other" as const,
+        status,
+        waiting: [...this.bots.values()].filter((bot) => bot.kind === "needsYou").length,
+      } : {}),
+    };
+  }
+
+  private async sendCompletionLinger(phone: Stored, botId: string): Promise<ActivityOutcome[]> {
+    const outcomes: ActivityOutcome[] = [];
+    const currentPhone = this.phones.find((candidate) => candidate.key === phone.key) ?? phone;
+    const running = currentPhone.registration.activities?.find((entry) => entry.botId === botId);
+    if (!running) return outcomes;
+    const slotKey = `${currentPhone.key}|${botId}`;
+    const envLinger = process.env.OMB_PHONE_ACTIVITY_LINGER_MS !== undefined
+      ? Number(process.env.OMB_PHONE_ACTIVITY_LINGER_MS)
+      : NaN;
+    const lingerMs = this.options.lingerMs ?? (Number.isFinite(envLinger) && envLinger >= 0 ? envLinger : DEFAULT_COMPLETION_LINGER_MS);
+    const activity = this.completionActivityBody(currentPhone, botId);
+    this.lastStatusSent.delete(slotKey);
+    this.lastProgressAt.delete(slotKey);
+    const updateOutcome = await this.post(currentPhone.key, botId, {
+      v: PHONE_PUSH_WIRE_VERSION,
+      token: running.token,
+      event: "update",
+      staleSeconds: Math.max(Math.ceil(lingerMs / 1_000) + 15, 30),
+      activity,
+    }, "apns");
+    outcomes.push(updateOutcome);
+    if (updateOutcome.result === "dropped") return outcomes;
+    this.setSlotTimer(this.lingerTimers, slotKey, lingerMs, () => {
+      if (this.bots.has(botId) || this.options.push.isLive(currentPhone.key)) return;
+      const latestPhone = this.phones.find((candidate) => candidate.key === currentPhone.key);
+      const latestRunning = latestPhone?.registration.activities?.find((entry) => entry.botId === botId);
+      if (!latestPhone || !latestRunning) return;
+      const endActivity = this.completionActivityBody(latestPhone, botId);
+      this.queue = this.queue.then(async () => {
+        await this.post(latestPhone.key, botId, {
+          v: PHONE_PUSH_WIRE_VERSION,
+          token: latestRunning.token,
+          event: "end",
+          dismissalSeconds: Math.floor(this.now() / 1_000),
+          activity: endActivity,
+        }, "apns");
+        this.dropActivity(latestPhone.key, botId);
+      }).catch((error: unknown) => {
+        this.log(`[phone-activity] could not end lingered activity: ${error instanceof Error ? error.message : String(error)}`);
+      });
+    });
+    return outcomes;
+  }
+
+  private async send(
+    phone: Stored,
+    botId: string,
+    wanted: ActivityKind | undefined,
+    was: ActivityKind | undefined,
+    state: BotState | undefined,
+    forceImmediateEnd = false,
+  ): Promise<ActivityOutcome[]> {
+    const outcomes: ActivityOutcome[] = [];
+    const currentPhone = this.phones.find((candidate) => candidate.key === phone.key) ?? phone;
+    const registration = currentPhone.registration;
     const kind = wanted ?? was;
     if (!kind) return outcomes;
-    const activity = this.activityBody(phone, botId, kind, state, botId);
+    const slotKey = `${currentPhone.key}|${botId}`;
+    const directApns = this.hasDirectApns();
+    const activity = this.activityBody(currentPhone, botId, kind, state, botId);
     const newlyNeedsYou = wanted === "needsYou" && was !== "needsYou";
+    const newlyWorking = directApns && wanted === "working" && !was;
     const event: ActivityEvent = wanted ? "update" : "end";
 
-    // An update or an end never alerts: that lights the screen and expands the Dynamic Island. The person hears of the
-    // ask from the closed-app notification.
     const running = registration.activities?.find((entry) => entry.botId === botId);
     if (running) {
-      outcomes.push(await this.post(phone.key, botId, { v: PHONE_PUSH_WIRE_VERSION, token: running.token, event, activity }, "apns"));
-      if (event === "end") this.dropActivity(phone.key, botId);
-    } else if (newlyNeedsYou && registration.startToken) {
-      // Only a bot that starts needing the person is started remotely, with the alert ActivityKit requires for that.
-      outcomes.push(await this.post(phone.key, botId, { v: PHONE_PUSH_WIRE_VERSION, token: registration.startToken, event: "start", alert: true, activity }, "apns"));
+      if (!wanted && directApns && !forceImmediateEnd) {
+        outcomes.push(...await this.sendCompletionLinger(currentPhone, botId));
+      } else {
+        const sent = await this.post(currentPhone.key, botId, { v: PHONE_PUSH_WIRE_VERSION, token: running.token, event, activity }, "apns");
+        outcomes.push(sent);
+        if (wanted === "working" && sent.result === "sent") {
+          this.lastProgressAt.set(slotKey, this.now());
+          this.lastStatusSent.set(slotKey, activity.status ?? activity.headline);
+        }
+        if (event === "end") {
+          this.lastProgressAt.delete(slotKey);
+          this.lastStatusSent.delete(slotKey);
+          this.dropActivity(currentPhone.key, botId);
+        }
+      }
+    } else if ((newlyNeedsYou || newlyWorking) && registration.startToken) {
+      const now = this.now();
+      if (!directApns || now >= (this.startingUntil.get(slotKey) ?? 0)) {
+        if (directApns) this.startingUntil.set(slotKey, now + STARTING_DEDUP_MS);
+        const startReq: DirectApnsActivityRequest = {
+          v: PHONE_PUSH_WIRE_VERSION,
+          token: registration.startToken,
+          event: "start",
+          alert: true,
+          ...(newlyWorking ? { silentStartAlert: true } : {}),
+          activity,
+        };
+        const sent = await this.post(currentPhone.key, botId, startReq, "apns");
+        outcomes.push(sent);
+        if (sent.result === "sent") {
+          this.lastProgressAt.set(slotKey, now);
+          this.lastStatusSent.set(slotKey, activity.status ?? activity.headline);
+        } else {
+          this.startingUntil.delete(slotKey);
+        }
+      }
     }
 
-    const device = this.options.push.deviceOf(phone.key);
+    const device = this.options.push.deviceOf(currentPhone.key);
     if (registration.ongoing && device?.platform === "fcm" && FCM_TOKEN.test(device.token)) {
-      outcomes.push(await this.post(phone.key, botId, { v: PHONE_PUSH_WIRE_VERSION, token: device.token, event, activity }, "fcm"));
+      const relaySafeActivity: PushRelayActivityRequest["activity"] = {
+        botId: activity.botId,
+        botName: activity.botName,
+        kind,
+        headline: activity.headline,
+        since: activity.since,
+        link: activity.link,
+        color: activity.color,
+        gradient: activity.gradient,
+        body: activity.body,
+        ...(activity.version === 1 ? { version: 1, ask: activity.ask, status: activity.status, waiting: activity.waiting } : {}),
+      };
+      outcomes.push(await this.post(currentPhone.key, botId, { v: PHONE_PUSH_WIRE_VERSION, token: device.token, event, activity: relaySafeActivity }, "fcm"));
     }
     return outcomes;
   }
 
-  private async post(key: string, botId: string, body: PushRelayActivityRequest, via: "apns" | "fcm"): Promise<ActivityOutcome> {
+  private async post(key: string, botId: string, body: DirectApnsActivityRequest | PushRelayActivityRequest, via: "apns" | "fcm"): Promise<ActivityOutcome> {
     const answer = await this.options.push.call(PHONE_ACTIVITY_RELAY_PATH, body, key);
     const base = { key, botId, event: body.event, via } as const;
     if (answer && answer.status < 300) return { ...base, result: "sent" };

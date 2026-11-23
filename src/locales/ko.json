@@ -7659,6 +7659,8 @@
   "phone.apns.statusNotSetUp": "설정 안 됨",
   "phone.apns.enabled": "iOS 푸시 알림 보내기",
   "phone.apns.enabledDetail": "승인, 질문, 로그인 요청, 완료된 답장 및 실시간 현황 업데이트가 있을 때 페어링된 iPhone을 깨웁니다.",
+  "phone.apns.includePreview": "메시지 미리보기 표시",
+  "phone.apns.includePreviewDetail": "알림 및 Dynamic Island에 대화 제목, 응답 요약, 실시간 도구 진행 상황을 표시합니다.",
   "phone.apns.environment": "APNs 환경",
   "phone.apns.environmentDetail": "IPA 서명에 사용한 프로비저닝 프로파일과 일치시키세요(Development는 Sandbox, App Store 또는 Ad Hoc은 Production).",
   "phone.apns.environmentSandbox": "Sandbox (Development)",

@@ -124,7 +124,7 @@ beforeAll(async () => {
   [on, off, direct] = await Promise.all([
     boot({ OMB_PHONE_PUSH: "1", OMB_CONTROL_PLANE_URL: stub.url, OMB_PUSH_CREDENTIAL: credential }),
     boot({ OMB_CONTROL_PLANE_URL: stub.url, OMB_PUSH_CREDENTIAL: credential }),
-    boot({ OMB_APNS_LOOPBACK_URL: apnsOrigin }),
+    boot({ OMB_APNS_LOOPBACK_URL: apnsOrigin, OMB_PHONE_ACTIVITY_LINGER_MS: "250" }),
   ]);
 }, 60_000);
 
@@ -282,18 +282,28 @@ describe("local direct APNs without cloud relay", () => {
     expect((await api(direct, "POST", `/api/bots/${scout.id}/messages`, { text: "run background check" })).status).toBe(202);
     await expect.poll(() => apnsReceived.filter((r) => r.headers["apns-push-type"] === "liveactivity").map((r) => r.body.aps?.event), { timeout: 30_000 }).toEqual(["update"]);
     writeFileSync(join(direct.home, "finish-gate"), "");
-    await expect.poll(() => apnsReceived.filter((r) => r.headers["apns-push-type"] === "liveactivity").map((r) => r.body.aps?.event), { timeout: 30_000 }).toEqual(["update", "end"]);
+    await expect.poll(() => apnsReceived.filter((r) => r.headers["apns-push-type"] === "liveactivity").map((r) => r.body.aps?.event), { timeout: 30_000 }).toEqual(["update", "update", "end"]);
     await expect.poll(() => apnsReceived.filter((r) => r.headers["apns-push-type"] === "alert").length, { timeout: 30_000 }).toBe(2);
 
-    const liveUpdate = apnsReceived.find((r) => r.headers["apns-push-type"] === "liveactivity" && r.body.aps?.event === "update")!;
+    const liveUpdates = apnsReceived.filter((r) => r.headers["apns-push-type"] === "liveactivity");
+    const liveUpdate = liveUpdates[0]!;
     expect(liveUpdate.headers[":path"]).toBe(`/3/device/${ACTIVITY_TOKEN}`);
     expect(liveUpdate.headers["apns-topic"]).toBe("com.example.mausbot.push-type.liveactivity");
     expect(liveUpdate.body.aps["content-state"].name).toBe("BotActivity");
-    expect(JSON.parse(liveUpdate.body.aps["content-state"].props)).toMatchObject({ botId: scout.id, name: "Scout", kind: "working", status: "Working" });
+    expect(JSON.parse(liveUpdate.body.aps["content-state"].props)).toMatchObject({ botId: scout.id, name: "Scout", kind: "working" });
+    expect(JSON.parse(liveUpdates[1]!.body.aps["content-state"].props)).toMatchObject({ botId: scout.id, name: "Scout", kind: "idle", mood: "idle" });
 
     const doneAlert = apnsReceived.filter((r) => r.headers["apns-push-type"] === "alert")[1]!;
     expect(doneAlert.headers[":path"]).toBe(`/3/device/${APNS_IPHONE}`);
     expect(doneAlert.body.body).toMatchObject({ kind: "done", botId: scout.id, botName: "Scout", threadId: scout.threadId });
+    expect(typeof doneAlert.body.aps.alert.body).toBe("string");
+
+    const privacySave = await api(direct, "PUT", "/api/push/apns", { includePreview: false });
+    expect(privacySave.body).toMatchObject({ apns: { includePreview: false } });
+    const vault = await createBot(direct, "Vault", "quick", "claude-sonnet-5");
+    const alertsBefore = apnsReceived.filter((r) => r.headers["apns-push-type"] === "alert").length;
+    expect((await api(direct, "POST", `/api/bots/${vault.id}/messages`, { text: "quiet check" })).status).toBe(202);
+    await expect.poll(() => apnsReceived.filter((r) => r.headers["apns-push-type"] === "alert").length, { timeout: 30_000 }).toBe(alertsBefore + 1);
     expect(JSON.stringify(apnsReceived)).not.toContain("PRIVATE-REPLY-TEXT");
 
     const cfgBeforeClear = await api(direct, "GET", "/api/config");

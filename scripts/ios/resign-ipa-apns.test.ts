@@ -72,11 +72,15 @@ describe.runIf(process.platform === "darwin")("resign-ipa-apns bundle patcher", 
     expect(mainInfo.OpenMausKeychainAccessGroup).toBe("AB12CD34EF.group.com.example.mausbot");
     expect(mainInfo.OpenMausLegacyKeychainAccessGroup).toBe("AB12CD34EF.com.example.mausbot");
     expect(mainInfo.ExpoWidgets_EnablePushNotifications).toBe(true);
+    expect(mainInfo.NSSupportsLiveActivities).toBe(true);
+    expect(mainInfo.NSSupportsLiveActivitiesFrequentUpdates).toBe(true);
     expect(mainInfo.UIBackgroundModes).toEqual(["audio", "remote-notification"]);
 
     const appConfig = JSON.parse(readFileSync(join(appDir, "EXConstants.bundle", "app.config"), "utf8"));
     expect(appConfig.scheme).toBe("openmausbot");
     expect(appConfig.ios.bundleIdentifier).toBe("com.example.mausbot");
+    expect(appConfig.ios.infoPlist.NSSupportsLiveActivities).toBe(true);
+    expect(appConfig.ios.infoPlist.NSSupportsLiveActivitiesFrequentUpdates).toBe(true);
     expect(appConfig.extra.remotePush).toEqual({ enabled: true, apnsEnvironment: "sandbox" });
 
     const widgetsInfo = plistToJson(join(appDir, "PlugIns", "ExpoWidgetsTarget.appex", "Info.plist"));

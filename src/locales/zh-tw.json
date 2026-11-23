@@ -10219,6 +10219,8 @@
   "phone.apns.statusNotSetUp": "尚未設定",
   "phone.apns.enabled": "傳送 iOS 推播通知",
   "phone.apns.enabledDetail": "在需要核准、提問、登入網站、完成回覆或更新靈動島即時動態時喚醒已配對的 iPhone。",
+  "phone.apns.includePreview": "顯示訊息內容預覽",
+  "phone.apns.includePreviewDetail": "在背景推播通知與靈動島顯示對話標題、回覆摘要與即時工具執行進度。",
   "phone.apns.environment": "APNs 環境",
   "phone.apns.environmentDetail": "請與重簽 IPA 時使用的描述檔一致（Development 使用 Sandbox；App Store 或 Ad Hoc 使用 Production）。",
   "phone.apns.environmentSandbox": "Sandbox（開發環境）",

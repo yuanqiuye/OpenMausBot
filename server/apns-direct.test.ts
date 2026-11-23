@@ -6,6 +6,8 @@ import { resolveApnsConfig, validateApnsPrivateKey } from "./apns-config.ts";
 import {
   APNS_TOKEN_WINDOW_MS,
   ApnsDirectClient,
+  buildApnsAlertPayload,
+  buildApnsLiveActivityPayload,
   createApnsProviderJwt,
   Http2SessionPool,
   type ApnsRawRequest,
@@ -255,5 +257,103 @@ describe("apns-config and ApnsDirectClient", () => {
     } finally {
       pool.close();
     }
+  });
+
+  it("builds 3-line rich alerts, silent working push-to-start, capsule answer pills, and idle checkmark state", () => {
+    const richAlert = buildApnsAlertPayload({
+      v: 1,
+      token: "a".repeat(64),
+      alertSubtitle: "Fix iOS notifications",
+      alertBody: "Build failed on step 3",
+      notification: { kind: "turn-failed", title: "Scout hit an error", botId: "bot_1", botName: "Scout", threadId: "thr_1" },
+    });
+    expect(richAlert.aps).toMatchObject({
+      alert: {
+        title: "Scout hit an error",
+        subtitle: "Fix iOS notifications",
+        body: "Build failed on step 3",
+      },
+      sound: "default",
+      "interruption-level": "time-sensitive",
+    });
+
+    const silentStart = buildApnsLiveActivityPayload({
+      v: 1,
+      token: "b".repeat(64),
+      event: "start",
+      silentStartAlert: true,
+      activity: {
+        version: 1,
+        ask: "other",
+        status: "Running · pnpm test",
+        waiting: 0,
+        botId: "bot_1",
+        botName: "Scout",
+        kind: "working",
+        headline: "Scout is working",
+        since: 1_700_000_000_000,
+        link: "openmausbot://chat/thr_1",
+        color: "#7C5CFF",
+        gradient: ["#7C5CFF"],
+        body: "round",
+      },
+    }, 1_700_000_000_000);
+    expect(silentStart.aps.alert).toEqual({ title: "Scout", body: "Running · pnpm test" });
+    expect("sound" in (silentStart.aps.alert as Record<string, unknown>)).toBe(false);
+
+    const needsYouPayload = buildApnsLiveActivityPayload({
+      v: 1,
+      token: "c".repeat(64),
+      event: "update",
+      activity: {
+        version: 1,
+        ask: "approval",
+        status: "Needs approval · rm -rf dist",
+        waiting: 1,
+        botId: "bot_1",
+        botName: "Scout",
+        kind: "needsYou",
+        headline: "Scout needs you",
+        since: 1_700_000_000_000,
+        link: "openmausbot://chat/thr_1",
+        color: "#7C5CFF",
+        gradient: ["#7C5CFF"],
+        body: "round",
+        answers: [
+          { label: "View chat", link: "openmausbot://chat/thr_1?from=island", refusal: true },
+          { label: "Review", link: "openmausbot://chat/thr_1?focus=approval", refusal: false },
+          { label: "Extra ignored", link: "openmausbot://chat/thr_1", refusal: false },
+        ],
+      },
+    }, 1_700_000_000_000);
+    const needsYouProps = JSON.parse((needsYouPayload.aps["content-state"] as { props: string }).props);
+    expect(needsYouProps.mood).toBe("needsYou");
+    expect(needsYouProps.answers).toHaveLength(2);
+    expect(needsYouProps.answers[1]).toEqual({ label: "Review", link: "openmausbot://chat/thr_1?focus=approval", refusal: false });
+
+    const idleCompletion = buildApnsLiveActivityPayload({
+      v: 1,
+      token: "d".repeat(64),
+      event: "update",
+      staleSeconds: 60,
+      activity: {
+        version: 1,
+        ask: "other",
+        status: "Finished · All 42 tests passed",
+        waiting: 0,
+        botId: "bot_1",
+        botName: "Scout",
+        kind: "idle",
+        headline: "Scout finished",
+        since: 1_700_000_000_000,
+        link: "openmausbot://chat/thr_1",
+        color: "#7C5CFF",
+        gradient: ["#7C5CFF"],
+        body: "round",
+      },
+    }, 1_700_000_000_000);
+    const idleProps = JSON.parse((idleCompletion.aps["content-state"] as { props: string }).props);
+    expect(idleProps).toMatchObject({ kind: "idle", mood: "idle", status: "Finished · All 42 tests passed" });
+    expect((idleCompletion.aps as Record<string, unknown>)["stale-date"]).toBe(1_700_000_060);
   });
 });

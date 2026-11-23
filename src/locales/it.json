@@ -11323,6 +11323,8 @@
   "phone.apns.statusNotSetUp": "Not set up",
   "phone.apns.enabled": "Send iOS push notifications",
   "phone.apns.enabledDetail": "Wakes paired iPhones for approvals, questions, sign-in requests, finished replies, and Live Activity updates.",
+  "phone.apns.includePreview": "Mostra anteprime dei messaggi",
+  "phone.apns.includePreviewDetail": "Includi titoli delle conversazioni, riepiloghi delle risposte e avanzamento live nelle notifiche e nella Dynamic Island.",
   "phone.apns.environment": "APNs environment",
   "phone.apns.environmentDetail": "Match the provisioning profile used to sign the IPA (Development uses Sandbox; App Store or Ad Hoc uses Production).",
   "phone.apns.environmentSandbox": "Sandbox (Development)",

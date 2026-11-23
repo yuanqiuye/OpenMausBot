@@ -563,4 +563,79 @@ describe("local direct APNs mode", () => {
     expect(apnsCalls).toHaveLength(1);
     expect(apnsCalls[0]?.origin).toBe("https://api.sandbox.push.apple.com");
   });
+
+  it("delivers 3-line rich previews and expanded kinds over direct APNs, redacts secrets, and respects includePreview=false", async () => {
+    const { raw } = sampleApnsConfig();
+    let includePreview = true;
+    const apnsCalls: ApnsRawRequest[] = [];
+    const relay = fakeRelay();
+    const apnsClient = new ApnsDirectClient({
+      now: () => clock,
+      transport: async (req) => {
+        apnsCalls.push(req);
+        return { status: 200, apnsId: "apns-rich", body: "" };
+      },
+    });
+    const push = new PhonePush({
+      dataDir,
+      access: () => ({ controlPlane: "https://accounts.openmausbot.test", credential: CREDENTIAL }),
+      apns: () => resolveApnsConfig({ ...raw, includePreview }),
+      apnsClient,
+      enabled: () => true,
+      live: () => false,
+      room: () => undefined,
+      threadTitle: (threadId) => (threadId === "th_deploy" ? "Deploy iOS build" : undefined),
+      fetchImpl: relay.fetchImpl,
+      now: () => clock,
+      log: () => {},
+      timers: { set: () => ({}), clear: () => {} },
+    });
+    await push.register(PHONE, { platform: "apns", token: APNS, environment: "sandbox" });
+    await push.register("companion:android", { platform: "fcm", token: FCM });
+
+    push.offer({
+      seq: 10,
+      notification: {
+        kind: "turn-failed",
+        botId: "bot_1",
+        botName: "Scout",
+        threadId: "th_deploy",
+        title: "Scout hit an error",
+        body: "xcodebuild failed with token sk-proj-1234567890abcdefghijklmnop",
+      },
+    }, everyone);
+    await push.flush();
+
+    expect(relay.calls.filter((call) => call.path.endsWith("/send"))).toEqual([]);
+    expect(apnsCalls).toHaveLength(1);
+    const richPayload = JSON.parse(apnsCalls[0]!.body);
+    expect(richPayload.aps.alert).toMatchObject({
+      title: "Scout hit an error",
+      subtitle: "Deploy iOS build",
+    });
+    expect(richPayload.aps.alert.body).toContain("xcodebuild failed");
+    expect(richPayload.aps.alert.body).not.toContain("sk-proj-1234567890");
+    expect(richPayload.aps["interruption-level"]).toBe("time-sensitive");
+
+    includePreview = false;
+    clock += 20_000;
+    push.offer({
+      seq: 11,
+      notification: {
+        kind: "done",
+        botId: "bot_1",
+        botName: "Scout",
+        threadId: "th_deploy",
+        title: "Scout finished",
+        body: "Sensitive body should stay hidden",
+      },
+    }, everyone);
+    await push.flush();
+
+    expect(apnsCalls).toHaveLength(2);
+    const privatePayload = JSON.parse(apnsCalls[1]!.body);
+    expect(privatePayload.aps.alert).toEqual({ title: "Scout finished" });
+    expect(JSON.stringify(privatePayload)).not.toContain("Sensitive body");
+    expect(JSON.stringify(privatePayload)).not.toContain("Deploy iOS build");
+  });
 });

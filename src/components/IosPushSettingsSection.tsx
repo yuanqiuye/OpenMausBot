@@ -35,6 +35,7 @@ export function IosPushSettingsSection() {
 
   const [open, setOpen] = useState(false);
   const [enabledDraft, setEnabledDraft] = useState<boolean | null>(null);
+  const [includePreviewDraft, setIncludePreviewDraft] = useState<boolean | null>(null);
   const [environmentDraft, setEnvironmentDraft] = useState<"sandbox" | "production" | null>(null);
   const [teamIdDraft, setTeamIdDraft] = useState<string | null>(null);
   const [keyIdDraft, setKeyIdDraft] = useState<string | null>(null);
@@ -48,6 +49,7 @@ export function IosPushSettingsSection() {
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
   const enabled = enabledDraft ?? (apns?.enabled ?? true);
+  const includePreview = includePreviewDraft ?? (apns?.includePreview ?? true);
   const environment = environmentDraft ?? (apns?.environment ?? "sandbox");
   const teamId = teamIdDraft ?? (apns?.teamId ?? "");
   const keyId = keyIdDraft ?? (apns?.keyId ?? "");
@@ -57,6 +59,7 @@ export function IosPushSettingsSection() {
   const apnsDevices = apns?.apnsDevices ?? 0;
 
   const dirty = enabledDraft !== null
+    || includePreviewDraft !== null
     || environmentDraft !== null
     || (teamIdDraft !== null && teamIdDraft.trim().toUpperCase() !== (apns?.teamId ?? ""))
     || (keyIdDraft !== null && keyIdDraft.trim().toUpperCase() !== (apns?.keyId ?? ""))
@@ -94,6 +97,7 @@ export function IosPushSettingsSection() {
         method: "PUT",
         body: JSON.stringify({
           enabled,
+          includePreview,
           environment,
           teamId: teamId.trim().toUpperCase(),
           keyId: keyId.trim().toUpperCase(),
@@ -104,6 +108,7 @@ export function IosPushSettingsSection() {
       });
       applyApns(response.apns);
       setEnabledDraft(null);
+      setIncludePreviewDraft(null);
       setEnvironmentDraft(null);
       setTeamIdDraft(null);
       setKeyIdDraft(null);
@@ -158,6 +163,14 @@ export function IosPushSettingsSection() {
               disabled={saving}
               aria-label={t("phone.apns.enabled")}
               onClick={() => { resetFeedback(); setEnabledDraft(!enabled); }}
+            />
+          </SettingRow>
+          <SettingRow title={t("phone.apns.includePreview")} subtitle={t("phone.apns.includePreviewDetail")}>
+            <Switch
+              checked={includePreview}
+              disabled={saving}
+              aria-label={t("phone.apns.includePreview")}
+              onClick={() => { resetFeedback(); setIncludePreviewDraft(!includePreview); }}
             />
           </SettingRow>
           <SettingRow title={t("phone.apns.environment")} subtitle={t("phone.apns.environmentDetail")}>

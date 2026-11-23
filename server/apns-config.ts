@@ -10,6 +10,7 @@ export const APNS_BUNDLE_ID = /^[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+$/;
 /** Direct APNs settings in `config.json` (`apns`), overridden by `OMB_APNS_*` environment variables. */
 export const apnsConfigSchema = z.object({
   enabled: z.boolean().optional(),
+  includePreview: z.boolean().optional(),
   teamId: z.string().trim().max(32).optional(),
   keyId: z.string().trim().max(32).optional(),
   bundleId: z.string().trim().max(155).optional(),
@@ -19,6 +20,7 @@ export const apnsConfigSchema = z.object({
 
 export interface ApnsConfig {
   enabled?: boolean;
+  includePreview?: boolean;
   teamId?: string;
   keyId?: string;
   bundleId?: string;
@@ -32,6 +34,7 @@ export interface ResolvedApnsConfig {
   bundleId: string;
   privateKey: string;
   defaultEnvironment: ApnsEnvironment;
+  includePreview: boolean;
 }
 
 export function normalizeApnsPem(raw: string): string {
@@ -119,6 +122,7 @@ export function resolveApnsConfig(apns: ApnsConfig | undefined): ResolvedApnsCon
     bundleId,
     privateKey: checked.pem,
     defaultEnvironment: apns.environment === "production" ? "production" : "sandbox",
+    includePreview: apns.includePreview !== false,
   };
 }
 
@@ -127,6 +131,9 @@ export function apnsConfigWithEnv(apns: ApnsConfig | undefined, env: NodeJS.Proc
   const rawEnabled = env.OMB_APNS_ENABLED?.trim().toLowerCase();
   if (rawEnabled === "1" || rawEnabled === "true") next.enabled = true;
   else if (rawEnabled === "0" || rawEnabled === "false") next.enabled = false;
+  const rawPreview = env.OMB_APNS_INCLUDE_PREVIEW?.trim().toLowerCase();
+  if (rawPreview === "1" || rawPreview === "true") next.includePreview = true;
+  else if (rawPreview === "0" || rawPreview === "false") next.includePreview = false;
   if (env.OMB_APNS_TEAM_ID !== undefined) next.teamId = env.OMB_APNS_TEAM_ID.trim().toUpperCase();
   if (env.OMB_APNS_KEY_ID !== undefined) next.keyId = env.OMB_APNS_KEY_ID.trim().toUpperCase();
   if (env.OMB_APNS_BUNDLE_ID !== undefined) next.bundleId = env.OMB_APNS_BUNDLE_ID.trim();
@@ -146,6 +153,7 @@ export function apnsConfigWithEnv(apns: ApnsConfig | undefined, env: NodeJS.Proc
 
 export interface ApnsSaveInput {
   enabled?: boolean;
+  includePreview?: boolean;
   teamId?: string;
   keyId?: string;
   bundleId?: string;
@@ -157,6 +165,7 @@ export interface ApnsSaveInput {
 export function apnsSavePatch(patch: ApnsSaveInput): ApnsConfig {
   const next: ApnsConfig = {};
   if (patch.enabled !== undefined) next.enabled = patch.enabled;
+  if (patch.includePreview !== undefined) next.includePreview = patch.includePreview;
   if (patch.teamId !== undefined) next.teamId = patch.teamId.trim().toUpperCase();
   if (patch.keyId !== undefined) next.keyId = patch.keyId.trim().toUpperCase();
   if (patch.bundleId !== undefined) next.bundleId = patch.bundleId.trim();
@@ -168,8 +177,10 @@ export function apnsSavePatch(patch: ApnsSaveInput): ApnsConfig {
 
 export function apnsSettingEnv(apns: ApnsConfig | undefined): Array<[value: string | undefined, name: string]> {
   const enabled = apns?.enabled === undefined ? undefined : apns.enabled ? "1" : "0";
+  const includePreview = apns?.includePreview === undefined ? undefined : apns.includePreview ? "1" : "0";
   return [
     [enabled, "OMB_APNS_ENABLED"],
+    [includePreview, "OMB_APNS_INCLUDE_PREVIEW"],
     [apns?.teamId, "OMB_APNS_TEAM_ID"],
     [apns?.keyId, "OMB_APNS_KEY_ID"],
     [apns?.bundleId, "OMB_APNS_BUNDLE_ID"],

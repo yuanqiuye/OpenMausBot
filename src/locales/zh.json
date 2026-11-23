@@ -10120,6 +10120,8 @@
   "phone.apns.statusNotSetUp": "未设置",
   "phone.apns.enabled": "发送 iOS 推送通知",
   "phone.apns.enabledDetail": "在需要批准、提问、登录网站、完成回复或更新灵动岛实时活动时唤醒已配对的 iPhone。",
+  "phone.apns.includePreview": "显示消息内容预览",
+  "phone.apns.includePreviewDetail": "在后台推送通知与灵动岛显示对话标题、回复摘要与实时工具执行进度。",
   "phone.apns.environment": "APNs 环境",
   "phone.apns.environmentDetail": "请与重签 IPA 所用的描述文件一致（Development 使用 Sandbox；App Store 或 Ad Hoc 使用 Production）。",
   "phone.apns.environmentSandbox": "Sandbox（开发环境）",
