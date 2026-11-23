@@ -1,4 +1,4 @@
-import { AudioLines, Blocks, CalendarClock, Fingerprint, Image, LockKeyhole, Monitor, Phone, Search, Server, Zap, type LucideIcon } from "lucide-react";
+import { AudioLines, Blocks, CalendarClock, Fingerprint, Image, LockKeyhole, Monitor, Phone, Search, Server, Smartphone, Zap, type LucideIcon } from "lucide-react";
 import type { AppSettingsSection, ConfigStatus } from "@/state/store";
 import type { SavedKey } from "@/state/config-status";
 import type { KeyProvider } from "@/lib/analytics-allowlist";
@@ -48,7 +48,7 @@ export interface KeyTarget {
 
 export type KeyId =
   | "openai" | "anthropic" | "xai" | "openrouter" | "mistral" | "cerebras" | "groq" | "greenference" | "modelgo" | "meta" | "deepseek" | "opencodeGo" | "opencodeProviders"
-  | "ollama" | "lmStudio" | "openaiCompat" | "liveCalls" | "liveKey" | "elevenlabs" | "fishAudio" | "geminiTts" | "box" | "vps" | "onePassword" | "composio" | "treg" | "postiz"
+  | "ollama" | "lmStudio" | "openaiCompat" | "liveCalls" | "liveKey" | "elevenlabs" | "fishAudio" | "geminiTts" | "box" | "vps" | "onePassword" | "composio" | "treg" | "postiz" | "apns"
   | "jev" | "openrouterHelper" | "workersAi" | "customDecider" | "imageOpenai" | "imageGemini" | "imageCustom";
 
 export type KeyMark = { driverKind: string; preset?: ProviderIconPreset } | { icon: LucideIcon };
@@ -183,6 +183,10 @@ export const KEY_CATALOG: readonly KeyEntry[] = [
     words: ["postiz", "social", "social media", "posts", "schedule", "linkedin", "instagram", "x", "twitter"], mark: { icon: CalendarClock }, kind: "key",
     target: { patch: (value) => ({ postiz: { key: value } }), slot: "postizApiKey", verifiedOnSave: true, saved: (config) => flag(config.postiz),
       placeholder: "…", placeholderKey: "keys.postiz.placeholder", href: "https://platform.postiz.com/settings", analytics: "postiz" } },
+  { id: "apns", section: "apps", labelKey: "keys.label.apns", purposeKey: "keys.purpose.apns", name: "Apple", env: ["OMB_APNS_PRIVATE_KEY", "OMB_APNS_PRIVATE_KEY_FILE"],
+    words: ["apns", "apple", "ios", "iphone", "ipad", "push", "p8", "live activity", "dynamic island"], mark: { icon: Smartphone }, kind: "elsewhere",
+    opens: "phone", whereKey: "keys.where.phone",
+    status: (config) => flag(config.savedKeys?.apnsPrivateKey ?? { configured: config.apns?.hasPrivateKey === true }) },
   { id: "jev", section: "helpers", labelKey: "decider.key.label", purposeKey: "keys.purpose.jev", name: "Jev", env: ["OMB_JEV_API_KEY"],
     words: ["jev", "typesafe", "decisions", "extraction", "helper", "rooms"], mark: { icon: Zap }, kind: "key",
     target: { patch: (value) => ({ decider: { key: value } }), slot: "jevApiKey", verifiedOnSave: true,
@@ -264,6 +268,7 @@ export function savedState(entry: KeyEntry, config: ConfigStatus | null | undefi
 /** With Azure, a custom endpoint, Fish Audio, Gemini or ElevenLabs chosen, Live calls do not use the OpenAI key the Live calls row points at, so that row is
  * hidden. */
 export function keyHidden(id: KeyId, config: ConfigStatus | null | undefined): boolean {
+  if (id === "apns") return config?.cloudHome === true;
   const provider = config?.live?.provider;
   return id === "liveCalls" && (provider === "azure" || provider === "custom" || provider === "fish" || provider === "gemini" || provider === "elevenlabs");
 }

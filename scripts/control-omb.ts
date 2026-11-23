@@ -228,6 +228,8 @@ export function verificationServerEnvironment(parentEnv: NodeJS.ProcessEnv, data
   childEnv.OMB_BUG_REPORT_URL = /^http:\/\/127\.0\.0\.1:\d{1,5}\/[A-Za-z0-9/_-]*$/.test(bugReportUrl) ? bugReportUrl : "http://127.0.0.1:9/api/bug-reports";
   const tregUrl = parentEnv.OMB_TREG_URL?.trim() ?? "";
   if (/^http:\/\/127\.0\.0\.1:\d{1,5}$/.test(tregUrl)) childEnv.OMB_TREG_URL = tregUrl;
+  const apnsUrl = parentEnv.OMB_APNS_LOOPBACK_URL?.trim() ?? "";
+  if (/^http:\/\/127\.0\.0\.1:\d{1,5}$/.test(apnsUrl)) childEnv.OMB_APNS_LOOPBACK_URL = apnsUrl;
   // Loopback only, for harness mechanics: a fake ElevenLabs the measurement
   // substrate can drive without a key. Never a real address.
   const elevenApi = parentEnv.OMB_ELEVENLABS_API?.trim() ?? "";

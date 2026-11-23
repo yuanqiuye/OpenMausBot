@@ -15,7 +15,7 @@ export const SETTINGS_HOW_TO_OPEN = "Settings opens from the menu under the pers
 
 export const SETTINGS_PLACES = [
   {"id":"page:overview","path":"Settings → (the place's own name, at the top)","words":["overview","place","status","version","domain","address","sidebar"]},
-  {"id":"page:phone","path":"Settings → Phone & devices","words":["phone","pair","pairing","qr","code","iphone","android","mobile","tablet","device","devices","wifi","wi-fi","anywhere","relay","remote","companion","tailscale","connect your phone","get the phone app","pair a device","this server","remote access"]},
+  {"id":"page:phone","path":"Settings → Phone & devices","words":["phone","pair","pairing","qr","code","iphone","ios","apns","push","live activity","dynamic island","android","mobile","tablet","device","devices","wifi","wi-fi","anywhere","relay","remote","companion","tailscale","connect your phone","get the phone app","pair a device","this server","remote access"]},
   {"id":"page:ai","path":"Settings → AI","words":["ai","models","model providers","providers","engines","api keys","keys","key","claude","codex","openai","anthropic","ollama","lm studio","local model"]},
   {"id":"page:bots","path":"Settings → You and your bots","words":["all bots","bots","about you","about me","profile","new bots","defaults","effort","limits","rules"],"advanced":true},
   {"id":"page:desktops","path":"Settings → Desktops & browser","words":["bot desktops","computer","desktop","desktops","browser","built-in browser","proxy","socks5","private desktop","sandbox","docker","podman","container","vps","own server","cloud desktops"],"advanced":true},

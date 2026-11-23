@@ -3,6 +3,7 @@ import { ArrowUpRight } from "lucide-react";
 import { t } from "@/lib/i18n";
 import { useStoreSelector } from "@/state/store-select";
 import { PhoneDevicesSection } from "../../PhoneDevicesSection";
+import { IosPushSettingsSection } from "../../IosPushSettingsSection";
 import { PlaceMark } from "../../PlacesRail";
 import { PlaceBadge } from "../SettingsNav";
 import { ServerPairingCard } from "../../ServerPairingCard";
@@ -68,6 +69,7 @@ export function PhonePage() {
       ? <PhoneDevicesSection profileEmail={config?.profile?.email} focusRequest={focus} simple={!ctx.advanced} placeName={place.name} top={<PairWithCloud />} />
       : <ServerPairingCard cloudHome={ctx.cloud} focusRequest={focus} team={config?.team?.name} placeName={place.name} simple={!ctx.advanced}
         teamPhoneBlocked={config?.managedPolicy?.remoteAccess === false ? t("policy.teamRemoteBlocked", { organization: config.managedPolicy.organizationName }) : null} />}
+    {!ctx.cloud && ctx.admin && <IosPushSettingsSection />}
     <OtherPlaces />
   </>;
 }

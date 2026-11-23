@@ -1,9 +1,14 @@
+import { generateKeyPairSync } from "node:crypto";
 import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
-import { PUSH_KINDS, phonePushCollapseId } from "../shared/phone-push.ts";
+import { PHONE_ACTIVITY_RELAY_PATH, PHONE_PUSH_RELAY_PATHS, PUSH_KINDS, phonePushCollapseId } from "../shared/phone-push.ts";
+import { apnsConfigWithEnv, apnsSavePatch, resolveApnsConfig } from "./apns-config.ts";
+import { ApnsDirectClient, type ApnsRawRequest } from "./apns-direct.ts";
+import { nestedKeyStatus } from "./key-hint.ts";
+import { activityRegistrationSchema, PhoneActivity } from "./phone-activity.ts";
 import {
   MAX_PUSH_DEVICES,
   PHONE_PUSH_DESKTOP_MESSAGE,
@@ -15,6 +20,7 @@ import {
   PhonePush,
   PhonePushAccessSource,
   RELAY_UNAVAILABLE_PAUSE_MS,
+  apnsStatusFor,
   phonePushEnabled,
   phonePushNotification,
   registrationSchema,
@@ -178,7 +184,7 @@ describe("registering a phone", () => {
   });
 
   it("takes only a well-formed registration", () => {
-    expect(registrationSchema.safeParse({ platform: "apns", token: APNS.toUpperCase() }).data).toEqual({ platform: "apns", token: APNS, environment: "production" });
+    expect(registrationSchema.safeParse({ platform: "apns", token: APNS.toUpperCase() }).data).toEqual({ platform: "apns", token: APNS });
     for (const body of [
       { platform: "apns", token: FCM },
       { platform: "fcm", token: "short" },
@@ -370,5 +376,191 @@ describe("where the relay credential comes from", () => {
     expect(at({})).toEqual({ controlPlane: "https://accounts.openmausbot.com", credential: CREDENTIAL });
     expect(at({ OMB_PUSH_CREDENTIAL: "not-a-credential" })).toBeNull();
     expect(at({ OMB_INSTALLATION_CREDENTIAL: CREDENTIAL, OMB_CONTROL_PLANE_URL: "http://127.0.0.1:8787" })).toEqual({ controlPlane: "http://127.0.0.1:8787", credential: CREDENTIAL });
+  });
+});
+
+describe("local direct APNs mode", () => {
+  function sampleApnsConfig() {
+    const { privateKey } = generateKeyPairSync("ec", { namedCurve: "prime256v1" });
+    const privateKeyPem = String(privateKey.export({ type: "pkcs8", format: "pem" })).trim();
+    return {
+      raw: { teamId: "TEAM123456", keyId: "KEY1234567", bundleId: "com.example.mausbot", privateKey: privateKeyPem, environment: "sandbox" as const },
+      resolved: resolveApnsConfig({ teamId: "TEAM123456", keyId: "KEY1234567", bundleId: "com.example.mausbot", privateKey: privateKeyPem, environment: "sandbox" })!,
+    };
+  }
+
+  it("auto-enables phonePushEnabled when direct APNs is configured unless explicitly disabled", () => {
+    const { raw } = sampleApnsConfig();
+    expect(phonePushEnabled({ apns: raw }, {})).toBe(true);
+    expect(phonePushEnabled({ apns: raw, features: { phonePush: false } }, {})).toBe(false);
+    expect(phonePushEnabled({ apns: raw }, { OMB_PHONE_PUSH: "0" })).toBe(false);
+  });
+
+  it("delivers alerts, Live Activity pushes, and test pushes directly without a cloud account while keeping FCM on relay", async () => {
+    const { resolved } = sampleApnsConfig();
+    const apnsCalls: ApnsRawRequest[] = [];
+    const apnsClient = new ApnsDirectClient({
+      now: () => clock,
+      transport: async (req) => {
+        apnsCalls.push(req);
+        return { status: 200, apnsId: "apns-direct-1", body: "" };
+      },
+    });
+    const { push, relay } = harness({ access: () => null, apns: () => resolved, apnsClient });
+    expect(push.status()).toBe("on");
+
+    const reg = await push.register(PHONE, { platform: "apns", token: APNS, environment: "sandbox", pairing: "pair_00000001" });
+    expect(reg.relay).toBe("registered");
+    expect(relay.calls).toEqual([]);
+
+    push.offer({ notification: notification(), seq: 12 }, everyone);
+    await push.flush();
+    expect(apnsCalls).toHaveLength(1);
+    expect(apnsCalls[0]?.origin).toBe("https://api.sandbox.push.apple.com");
+    expect(apnsCalls[0]?.headers["apns-topic"]).toBe("com.example.mausbot");
+
+    const actToken = "ef".repeat(32);
+    const actReg = await push.call(PHONE_PUSH_RELAY_PATHS.register, { v: 1, platform: "apns", purpose: "activity-start", token: actToken, environment: "sandbox" });
+    expect(actReg).toEqual({ status: 200 });
+    expect(push.counts()).toEqual({ apnsDevices: 1, activityTokens: 1 });
+
+    const reloaded = new PhonePush({
+      dataDir,
+      access: () => ACCESS,
+      apns: () => resolved,
+      apnsClient,
+      enabled: () => true,
+      live: () => false,
+      room: () => undefined,
+      fetchImpl: relay.fetchImpl,
+      now: () => clock,
+      log: () => {},
+    });
+    const actSend = await reloaded.call(PHONE_ACTIVITY_RELAY_PATH, {
+      v: 1,
+      token: actToken,
+      event: "start",
+      alert: true,
+      activity: {
+        version: 1,
+        ask: "approval",
+        status: "Needs approval",
+        waiting: 1,
+        botId: "bot_1",
+        botName: "Scout",
+        kind: "needsYou",
+        headline: "Scout needs you",
+        since: clock,
+        link: "openmausbot://chat/th_1",
+        color: "#7C5CFF",
+        gradient: ["#7C5CFF"],
+        body: "cursor",
+      },
+    });
+    expect(actSend).toEqual({ status: 202 });
+    expect(apnsCalls[1]?.headers["apns-topic"]).toBe("com.example.mausbot.push-type.liveactivity");
+    expect(relay.calls).toEqual([]);
+
+    const fcmAct = await reloaded.call(PHONE_ACTIVITY_RELAY_PATH, {
+      v: 1,
+      token: FCM,
+      event: "update",
+      activity: {
+        botId: "bot_1",
+        botName: "Scout",
+        kind: "working",
+        headline: "Scout is working",
+        since: clock,
+        link: "openmausbot://chat/th_1",
+        color: "#7C5CFF",
+        gradient: ["#7C5CFF"],
+        body: "cursor",
+      },
+    });
+    expect(fcmAct?.status).toBe(200);
+    expect(relay.calls).toHaveLength(1);
+
+    const testResult = await reloaded.sendTest({ botId: "bot_1", botName: "Scout", threadId: "th_1" });
+    expect(testResult).toEqual({ ok: true, sent: 1, total: 1 });
+    expect(apnsCalls).toHaveLength(3);
+  });
+
+  it("keeps env-sourced .p8 keys out of metadata save patches and validates PEM key status without emitting last4", () => {
+    const { raw } = sampleApnsConfig();
+    const keyFile = join(dataDir, "AuthKey_KEY1234567.p8");
+    writeFileSync(keyFile, raw.privateKey, "utf8");
+    const envLoaded = apnsConfigWithEnv({ teamId: raw.teamId, keyId: raw.keyId, bundleId: raw.bundleId }, { OMB_APNS_PRIVATE_KEY_FILE: keyFile });
+    expect(envLoaded.privateKey).toContain("BEGIN PRIVATE KEY");
+
+    const metadataPatch = apnsSavePatch({ environment: "production", enabled: true });
+    expect("privateKey" in metadataPatch).toBe(false);
+    expect(apnsSavePatch({ clearPrivateKey: true })).toEqual({ privateKey: "" });
+
+    expect(apnsStatusFor({ apns: { ...raw, privateKey: "not-a-valid-pem" } }).hasPrivateKey).toBe(false);
+    expect(apnsStatusFor({ apns: raw }).hasPrivateKey).toBe(true);
+    expect(nestedKeyStatus({ apns: { ...raw, privateKey: "not-a-valid-pem" } } as never).apnsPrivateKey).toEqual({ configured: false });
+    expect(nestedKeyStatus({ apns: raw } as never).apnsPrivateKey).toEqual({ configured: true });
+  });
+
+  it("routes Sandbox Live Activity startToken to sandbox APNs even when PUT /api/push/activity arrives before PUT /api/push/device", async () => {
+    const { raw } = sampleApnsConfig();
+    const prodDefault = resolveApnsConfig({ ...raw, environment: "production" })!;
+    const apnsCalls: ApnsRawRequest[] = [];
+    const apnsClient = new ApnsDirectClient({
+      now: () => clock,
+      transport: async (req) => {
+        apnsCalls.push(req);
+        return { status: 200, apnsId: "apns-live-sandbox", body: "" };
+      },
+    });
+    const { push } = harness({ access: () => null, apns: () => prodDefault, apnsClient });
+    const openAsks = new Set<string>();
+    const activity = new PhoneActivity({
+      dataDir,
+      push,
+      hasOpenAsk: (botId) => openAsks.has(botId),
+      bot: () => ({ name: "Scout", busy: true, threadId: "th_1" }),
+      botOfThread: () => "bot_1",
+      now: () => clock,
+      log: () => {},
+      timers: { set: () => ({}), clear: () => {} },
+    });
+
+    const startToken = "9a".repeat(40);
+    await activity.register(PHONE, activityRegistrationSchema.parse({
+      scheme: "openmausbot",
+      headlines: { needsYou: "{name} needs you", working: "{name} is working" },
+      startToken,
+    }));
+    await push.register(PHONE, { platform: "apns", token: APNS, environment: "sandbox" });
+
+    openAsks.add("bot_1");
+    activity.offer({ kind: "notify", notification: { kind: "approval", botId: "bot_1", botName: "Scout", threadId: "th_1", title: "Approve" } }, everyone);
+    await activity.flushNow();
+
+    expect(apnsCalls).toHaveLength(1);
+    expect(apnsCalls[0]?.origin).toBe("https://api.sandbox.push.apple.com");
+    expect(apnsCalls[0]?.headers["apns-topic"]).toBe("com.example.mausbot.push-type.liveactivity");
+  });
+
+  it("falls back to configured APNs environment when registration omits environment", async () => {
+    const { resolved } = sampleApnsConfig();
+    const apnsCalls: ApnsRawRequest[] = [];
+    const apnsClient = new ApnsDirectClient({
+      now: () => clock,
+      transport: async (req) => {
+        apnsCalls.push(req);
+        return { status: 200, apnsId: "apns-env-fallback", body: "" };
+      },
+    });
+    const { push } = harness({ access: () => null, apns: () => resolved, apnsClient });
+    const parsed = registrationSchema.parse({ platform: "apns", token: APNS });
+    expect(parsed.environment).toBeUndefined();
+    await push.register(PHONE, parsed);
+
+    push.offer({ notification: notification(), seq: 1 }, everyone);
+    await push.flush();
+    expect(apnsCalls).toHaveLength(1);
+    expect(apnsCalls[0]?.origin).toBe("https://api.sandbox.push.apple.com");
   });
 });

@@ -162,7 +162,7 @@ export class PhoneActivity {
     if (!previous && others.length >= MAX_ACTIVITY_PHONES) throw Object.assign(new Error("Too many phones"), { status: 409 });
     this.phones = [...others, { key, registration: input, updatedAt: this.now() }];
     this.persist();
-    const environment = this.options.push.deviceOf(key)?.environment ?? "production";
+    const environment = this.options.push.deviceOf(key)?.environment ?? this.options.push.defaultApnsEnvironment();
     const tokens = (registration: PhoneActivityRegistration | undefined) => new Map<string, "activity" | "activity-start">([
       ...(registration?.startToken ? [[registration.startToken, "activity-start"] as const] : []),
       ...(registration?.activities ?? []).map(({ token }) => [token, "activity"] as const),
@@ -170,11 +170,11 @@ export class PhoneActivity {
     const before = tokens(previous?.registration);
     const after = tokens(input);
     for (const token of before.keys()) {
-      if (!after.has(token)) void this.options.push.call(PHONE_PUSH_RELAY_PATHS.unregister, { v: PHONE_PUSH_WIRE_VERSION, platform: "apns", token });
+      if (!after.has(token)) void this.options.push.call(PHONE_PUSH_RELAY_PATHS.unregister, { v: PHONE_PUSH_WIRE_VERSION, platform: "apns", token }, key);
     }
     if (this.options.push.status() === "on") {
       for (const [token, purpose] of after) {
-        if (!before.has(token)) await this.options.push.call(PHONE_PUSH_RELAY_PATHS.register, { v: PHONE_PUSH_WIRE_VERSION, platform: "apns", purpose, token, environment });
+        if (!before.has(token)) await this.options.push.call(PHONE_PUSH_RELAY_PATHS.register, { v: PHONE_PUSH_WIRE_VERSION, platform: "apns", purpose, token, environment }, key);
       }
     }
     // The phone said which activities it holds: anything it no longer lists is not on screen.
@@ -376,7 +376,7 @@ export class PhoneActivity {
   }
 
   private async post(key: string, botId: string, body: PushRelayActivityRequest, via: "apns" | "fcm"): Promise<ActivityOutcome> {
-    const answer = await this.options.push.call(PHONE_ACTIVITY_RELAY_PATH, body);
+    const answer = await this.options.push.call(PHONE_ACTIVITY_RELAY_PATH, body, key);
     const base = { key, botId, event: body.event, via } as const;
     if (answer && answer.status < 300) return { ...base, result: "sent" };
     if (answer && (answer.status === 410 || answer.code === PUSH_RELAY_ERRORS.unregistered || answer.code === PUSH_RELAY_ERRORS.unknownDevice)) {

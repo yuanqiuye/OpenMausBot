@@ -3,7 +3,10 @@
 // identifier, only the phone that holds no live event stream; signing a phone out unregisters its token; a phone whose
 // stream closes gets the next one. A second server with phone push left off keeps nothing and calls nobody.
 import { spawn, type ChildProcess } from "node:child_process";
+import { generateKeyPairSync, verify } from "node:crypto";
 import { chmodSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import http2, { type Http2Server, type ServerHttp2Stream } from "node:http2";
+import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -25,8 +28,12 @@ const FCM_B = `fcmPhoneB_01:APA91b${"Q".repeat(140)}`;
 interface Fixture { child: ChildProcess; home: string; base: string; stderr: () => string }
 
 let stub: ControlPlaneStub;
+let apnsH2: Http2Server;
+let apnsOrigin = "";
+const apnsReceived: Array<{ headers: Record<string, string>; body: any }> = [];
 let on: Fixture;
 let off: Fixture;
+let direct: Fixture;
 const streams: SseRecorder[] = [];
 
 async function boot(env: Record<string, string>): Promise<Fixture> {
@@ -98,20 +105,37 @@ beforeAll(async () => {
   chmodSync(FAKE_CLAUDE, 0o755);
   chmodSync(FAKE_ACP, 0o755);
   stub = await startControlPlaneStub();
+  apnsH2 = http2.createServer();
+  apnsH2.on("stream", (stream: ServerHttp2Stream, headers) => {
+    const chunks: Buffer[] = [];
+    stream.on("data", (chunk) => chunks.push(Buffer.from(chunk)));
+    stream.on("end", () => {
+      const flat: Record<string, string> = {};
+      for (const [k, v] of Object.entries(headers)) if (typeof v === "string") flat[k] = v;
+      apnsReceived.push({ headers: flat, body: JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}") });
+      stream.respond({ ":status": 200, "apns-id": "e2e-apns-id" });
+      stream.end("{}");
+    });
+  });
+  await new Promise<void>((resolve) => apnsH2.listen(0, "127.0.0.1", resolve));
+  apnsOrigin = `http://127.0.0.1:${(apnsH2.address() as AddressInfo).port}`;
+
   const credential = stub.seedInstallation("phone push fixture");
-  [on, off] = await Promise.all([
+  [on, off, direct] = await Promise.all([
     boot({ OMB_PHONE_PUSH: "1", OMB_CONTROL_PLANE_URL: stub.url, OMB_PUSH_CREDENTIAL: credential }),
     boot({ OMB_CONTROL_PLANE_URL: stub.url, OMB_PUSH_CREDENTIAL: credential }),
+    boot({ OMB_APNS_LOOPBACK_URL: apnsOrigin }),
   ]);
 }, 60_000);
 
 afterAll(async () => {
   for (const stream of streams) stream.close();
-  for (const fixture of [on, off]) {
+  for (const fixture of [on, off, direct]) {
     if (!fixture) continue;
     await waitForExit(fixture.child, { signal: "SIGTERM" });
     await removeTempDir(fixture.home);
   }
+  await new Promise<void>((resolve) => apnsH2 ? apnsH2.close(() => resolve()) : resolve());
   await stub?.close();
 });
 
@@ -211,5 +235,77 @@ describe("Live Activities by push", () => {
     for (const body of activityPushes()) expect(body).not.toHaveProperty("alert");
     expect(JSON.stringify(activityPushes())).not.toContain("PRIVATE-REPLY-TEXT");
     await expect.poll(() => stub.pushes.at(-1), { timeout: 10_000 }).toEqual({ path: "/v1/installations/self/push/unregister", body: { v: 1, platform: "apns", token: ACTIVITY } });
+  }, 90_000);
+});
+
+describe("local direct APNs without cloud relay", () => {
+  it("configures a .p8 key via /api/push/apns and delivers ES256-signed HTTP/2 alerts and Live Activity updates directly", async () => {
+    const { privateKey, publicKey } = generateKeyPairSync("ec", { namedCurve: "prime256v1" });
+    const pem = privateKey.export({ format: "pem", type: "pkcs8" }).toString();
+    const APNS_IPHONE = "d4".repeat(32);
+    const ACTIVITY_TOKEN = "e5".repeat(40);
+
+    const saved = await api(direct, "PUT", "/api/push/apns", {
+      enabled: true,
+      teamId: "TEAM123456",
+      keyId: "KEY1234567",
+      bundleId: "com.example.mausbot",
+      environment: "sandbox",
+      privateKey: pem,
+    });
+    expect(saved.status).toBe(200);
+    expect(saved.body).toMatchObject({ apns: { configured: true, enabled: true, hasPrivateKey: true, bundleId: "com.example.mausbot" } });
+    expect(JSON.stringify(saved.body)).not.toContain("BEGIN PRIVATE KEY");
+
+    const phone = await pair(direct, "Direct iPhone");
+    const devRes = await api(direct, "PUT", "/api/push/device", { platform: "apns", token: APNS_IPHONE, environment: "sandbox" }, phone.token);
+    expect(devRes.body).toMatchObject({ push: "on", relay: "registered" });
+
+    const testPush = await api(direct, "POST", "/api/push/apns/test", {});
+    expect(testPush).toEqual({ status: 200, body: { ok: true, sent: 1, total: 1 } });
+    expect(apnsReceived).toHaveLength(1);
+    expect(apnsReceived[0]!.headers["apns-topic"]).toBe("com.example.mausbot");
+    expect(apnsReceived[0]!.headers["apns-push-type"]).toBe("alert");
+
+    const jws = apnsReceived[0]!.headers.authorization!.replace(/^bearer\s+/i, "");
+    const [hdr, claims, sig] = jws.split(".");
+    expect(verify("sha256", Buffer.from(`${hdr}.${claims}`), { key: publicKey, dsaEncoding: "ieee-p1363" }, Buffer.from(sig!, "base64url"))).toBe(true);
+
+    const scout = await createBot(direct, "Scout", "slow", "claude-sonnet-5");
+    await api(direct, "PUT", "/api/push/activity", {
+      scheme: "openmausbot",
+      headlines: { needsYou: "{name} needs you", working: "{name} is working" },
+      statuses: { working: "Working", needsYou: { approval: "Needs approval", question: "Has a question", signIn: "Needs sign-in", other: "Needs you" } },
+      activities: [{ botId: scout.id, token: ACTIVITY_TOKEN }],
+    }, phone.token);
+
+    expect((await api(direct, "POST", `/api/bots/${scout.id}/messages`, { text: "run background check" })).status).toBe(202);
+    await expect.poll(() => apnsReceived.filter((r) => r.headers["apns-push-type"] === "liveactivity").map((r) => r.body.aps?.event), { timeout: 30_000 }).toEqual(["update"]);
+    writeFileSync(join(direct.home, "finish-gate"), "");
+    await expect.poll(() => apnsReceived.filter((r) => r.headers["apns-push-type"] === "liveactivity").map((r) => r.body.aps?.event), { timeout: 30_000 }).toEqual(["update", "end"]);
+    await expect.poll(() => apnsReceived.filter((r) => r.headers["apns-push-type"] === "alert").length, { timeout: 30_000 }).toBe(2);
+
+    const liveUpdate = apnsReceived.find((r) => r.headers["apns-push-type"] === "liveactivity" && r.body.aps?.event === "update")!;
+    expect(liveUpdate.headers[":path"]).toBe(`/3/device/${ACTIVITY_TOKEN}`);
+    expect(liveUpdate.headers["apns-topic"]).toBe("com.example.mausbot.push-type.liveactivity");
+    expect(liveUpdate.body.aps["content-state"].name).toBe("BotActivity");
+    expect(JSON.parse(liveUpdate.body.aps["content-state"].props)).toMatchObject({ botId: scout.id, name: "Scout", kind: "working", status: "Working" });
+
+    const doneAlert = apnsReceived.filter((r) => r.headers["apns-push-type"] === "alert")[1]!;
+    expect(doneAlert.headers[":path"]).toBe(`/3/device/${APNS_IPHONE}`);
+    expect(doneAlert.body.body).toMatchObject({ kind: "done", botId: scout.id, botName: "Scout", threadId: scout.threadId });
+    expect(JSON.stringify(apnsReceived)).not.toContain("PRIVATE-REPLY-TEXT");
+
+    const cfgBeforeClear = await api(direct, "GET", "/api/config");
+    expect((cfgBeforeClear.body.savedKeys as Record<string, unknown>).apnsPrivateKey).toEqual({ configured: true });
+
+    const bypassAttempt = await api(direct, "PUT", "/api/config", { apns: { bundleId: "bad" } });
+    expect(bypassAttempt.status).toBe(400);
+
+    const cleared = await api(direct, "PUT", "/api/push/apns", { clearPrivateKey: true });
+    expect(cleared.status).toBe(200);
+    expect(cleared.body).toMatchObject({ apns: { configured: false, hasPrivateKey: false } });
+    const cfgAfterClear = await api(direct, "GET", "/api/config");
+    expect((cfgAfterClear.body.savedKeys as Record<string, unknown>).apnsPrivateKey).toEqual({ configured: false });
   }, 90_000);
 });

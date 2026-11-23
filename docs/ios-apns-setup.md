@@ -1,0 +1,122 @@
+# iOS 背景通知與靈動島（Live Activity）本地直連 APNs 設定指南
+
+OpenMausBot 支援透過你自己的 **Apple Developer `.p8` 推播金鑰（APNs AuthKey）**，直接從本地電腦向已配對的 iPhone / iPad 發送：
+
+1. **關掉 App 後的背景通知（Alert Push）**：`approval`（需要核准）、`question`（機器人提問）、`sign-in`（需要登入網站）、`done`（回覆完成）。
+2. **鎖屏即時動態與靈動島背景更新（ActivityKit Live Activity Push）**：在 App 退到背景時自動遠端啟動（`push-to-start`）、更新進度與收合靈動島。
+
+全程不經過第三方中繼伺服器，且推播內容維持隱私設計（僅含事件類型、機器人名稱與對話 ID，絕不把對話原文送到 Apple APNs）。
+
+---
+
+## 第一步：在 Apple Developer Portal 建立憑證與 App ID
+
+> **注意**：Apple 免費個人帳號（Personal Team）不支援 `Push Notifications`（`aps-environment`）權限；需具備付費 Apple Developer Program 帳號。
+
+1. **建立 APNs AuthKey（`.p8`）**：
+   - 前往 [Certificates, Identifiers & Profiles → Keys](https://developer.apple.com/account/resources/authkeys/list) 點擊 **+**。
+   - 勾選 **Apple Push Notifications service (APNs)**，下載 `AuthKey_XXXXXXXXXX.p8`，並記下 **10 碼 Key ID** 與右上角的 **10 碼 Team ID**。
+   - 同一把 `.p8` 金鑰同時支援一般背景推播（`<bundleId>`）與靈動島推播（`<bundleId>.push-type.liveactivity`）。
+
+2. **建立 App Group**：
+   - 前往 **Identifiers → App Groups**，新增例如 `group.com.yourname.mausbot`。
+
+3. **建立 App IDs**：
+   - **主程式 App ID**（例如 `com.yourname.mausbot`）：勾選 **Push Notifications** 與 **App Groups**（綁定上面的 `group.com.yourname.mausbot`）。
+   - **靈動島 Widget Extension App ID**（例如 `com.yourname.mausbot.widgets`）：勾選 **App Groups**（綁定同一個 `group.com.yourname.mausbot`）。
+   - *(選用)* 若想保留系統分享選單擴充功能，再建立 `com.yourname.mausbot.share` 並勾選同一個 **App Groups**；否則重簽時加上 `--strip-share-extension` 即可省去第 3 個描述檔。
+
+4. **產生 Provisioning Profiles（若使用命令列 `codesign`）**：
+   - 為 `com.yourname.mausbot` 與 `com.yourname.mausbot.widgets` 分別建立 **iOS App Development**（對應 `sandbox`）或 **Ad Hoc**（對應 `production`）描述檔（`.mobileprovision`），並勾選你的 iPhone UDID。
+
+---
+
+## 第二步：修補與重簽脫殼版 MausBot IPA
+
+MausBot v2.0.0 App Store 版預設關閉了 `extra.remotePush.enabled` 與 `ExpoWidgets_EnablePushNotifications`。請使用內建腳本 `scripts/ios/resign-ipa-apns.mjs` 一鍵修補：
+
+### 方式 A：只修補 IPA，交給 Feather / Sideloadly / ESign / AltStore 重簽（`--patch-only`）
+
+```bash
+node scripts/ios/resign-ipa-apns.mjs \
+  --ipa ~/Downloads/MausBot-decrypted.ipa \
+  --out ~/Downloads/MausBot-apns-patched.ipa \
+  --team-id YOURTEAM10 \
+  --bundle-id com.yourname.mausbot \
+  --environment sandbox \
+  --strip-share-extension \
+  --patch-only
+```
+
+接著用你慣用的簽名工具（務必使用含有 `aps-environment` Push Notifications 權限的描述檔，並保持相同的 Bundle ID 與 Team ID）簽名安裝到 iPhone。
+
+### 方式 B：在 macOS 直接完成修補 + `codesign` 重簽
+
+```bash
+node scripts/ios/resign-ipa-apns.mjs \
+  --ipa ~/Downloads/MausBot-decrypted.ipa \
+  --out ~/Downloads/MausBot-apns-signed.ipa \
+  --team-id YOURTEAM10 \
+  --bundle-id com.yourname.mausbot \
+  --environment sandbox \
+  --strip-share-extension \
+  --identity "Apple Development: Your Name (XXXXXXXXXX)" \
+  --profile ~/Downloads/MausBot_Dev.mobileprovision \
+  --widgets-profile ~/Downloads/MausBot_Widgets_Dev.mobileprovision
+```
+
+簽名完成後，可用 **Xcode → Window → Devices and Simulators** 或 **Apple Configurator** 安裝 `MausBot-2.0.0-apns-signed.ipa`。
+
+### 腳本自動修補的項目
+
+- `EXConstants.bundle/app.config`：開啟 `extra.remotePush = { enabled: true, apnsEnvironment }`，並將 `scheme` 對齊為 `"openmausbot"`，確保點擊推播或靈動島能跳回對應對話。
+- `MausBot.app/Info.plist`：
+  - 開啟 `ExpoWidgets_EnablePushNotifications = true`（啟用靈動島 ActivityKit 遠端推播 Token）。
+  - 在 `UIBackgroundModes` 加入 `remote-notification`。
+  - 將 `CFBundleIdentifier`、`OpenMausAppGroup`、`ExpoWidgetsAppGroupIdentifier`、`OpenMausKeychainAccessGroup`、`OpenMausLegacyKeychainAccessGroup` 對齊至你的 `Team ID` 與 `Bundle ID`（避免 iOS Keychain `-34018` `errSecMissingEntitlement` 閃退或無法儲存配對金鑰）。
+- `PlugIns/ExpoWidgetsTarget.appex/Info.plist`：同步更新為 `<bundleId>.widgets` 與相同 App Group。
+
+---
+
+## 第三步：在 OpenMausBot 設定 APNs 金鑰
+
+### 方法 1：透過圖形介面（推薦）
+
+1. 打開 OpenMausBot **Settings → Phone & devices（手機與裝置）**。
+2. 展開 **iOS background notifications → Apple push key (.p8)**。
+3. 填入：
+   - **APNs environment**：Development 描述檔選 `Sandbox (Development)`；Ad Hoc 描述檔選 `Production`。
+   - **Apple Team ID**：10 碼 Team ID。
+   - **APNs Key ID**：10 碼 Key ID。
+   - **App Bundle ID**：例如 `com.yourname.mausbot`。
+   - **APNs AuthKey (.p8)**：點擊 **Choose .p8 file** 選擇 `AuthKey_XXXXXXXXXX.p8` 或直接貼上內容。
+4. 點擊 **Save**。
+5. 在 iPhone 打開重簽後的 MausBot 與這台電腦完成配對並允許通知權限，回到電腦點擊 **Send test notification** 即可收到測試推播！
+
+### 方法 2：透過 `config.json` 或環境變數
+
+在資料目錄的 `config.json` 中加入：
+
+```json
+{
+  "apns": {
+    "enabled": true,
+    "teamId": "YOURTEAM10",
+    "keyId": "YOURKEYID0",
+    "bundleId": "com.yourname.mausbot",
+    "environment": "sandbox",
+    "privateKey": "-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----"
+  }
+}
+```
+
+或使用環境變數覆寫：
+
+```bash
+export OMB_APNS_ENABLED=1
+export OMB_APNS_TEAM_ID="YOURTEAM10"
+export OMB_APNS_KEY_ID="YOURKEYID0"
+export OMB_APNS_BUNDLE_ID="com.yourname.mausbot"
+export OMB_APNS_ENVIRONMENT="sandbox"
+export OMB_APNS_PRIVATE_KEY_FILE="/path/to/AuthKey_YOURKEYID0.p8"
+```

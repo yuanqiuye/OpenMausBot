@@ -11,6 +11,7 @@ const SETTINGS_DIR = "src/components/settings";
 const SHARED = [
   "SettingsPrimitives.tsx", "NotificationSettingsRows.tsx", "AppSettingsRows.tsx", "AnalyticsRow.tsx", "OpenAtLoginRow.tsx",
   "TalkShortcutRow.tsx", "SidebarProfileMenu.tsx", "PlaceLookCard.tsx", "DefaultBotControls.tsx", "PhoneDevicesSection.tsx",
+  "IosPushSettingsSection.tsx",
 ].map((file) => `src/components/${file}`);
 
 function files(): string[] {

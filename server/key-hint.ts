@@ -1,4 +1,5 @@
 import type { AppConfig } from "./config.ts";
+import { usableApnsPrivateKey } from "./apns-config.ts";
 import { usableLiveKey } from "./live-config.ts";
 
 /** Security: a hint is the last four characters of a key long enough that four reveal nothing useful, and only admins
@@ -27,6 +28,7 @@ export function nestedKeyStatus(cfg: AppConfig) {
     customImageApiKey: keyStatus(cfg.imageGen?.customApiKey),
     geminiImageApiKey: keyStatus(cfg.imageGen?.geminiKey),
     openaiLiveKey: keyStatus(usableLiveKey(cfg.live)),
+    apnsPrivateKey: { configured: Boolean(usableApnsPrivateKey(cfg.apns)) },
   };
 }
 

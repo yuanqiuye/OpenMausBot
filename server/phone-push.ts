@@ -12,6 +12,7 @@ import {
   APNS_TOKEN,
   FCM_TOKEN,
   PAIRING_TAG,
+  PHONE_ACTIVITY_RELAY_PATH,
   PHONE_PUSH_RELAY_PATHS,
   PHONE_PUSH_WIRE_VERSION,
   PUSH_ID,
@@ -28,7 +29,10 @@ import {
   type PhonePushState,
   type PublicPushDevice,
   type PushKind,
+  type PushRelayActivityRequest,
 } from "../shared/phone-push.ts";
+import { apnsConfigWithEnv, resolveApnsConfig, usableApnsPrivateKey, type ApnsConfig, type ApnsEnvironment, type ResolvedApnsConfig } from "./apns-config.ts";
+import { ApnsDirectClient } from "./apns-direct.ts";
 import { writeFileAtomic } from "./atomic.ts";
 import { conversationLanguage, serverLine, type ServerLineKey } from "./server-lines.ts";
 
@@ -62,17 +66,51 @@ const TITLES: Record<PushKind, ServerLineKey> = {
   done: "server.notify.done",
 };
 
-/** On only when switched on: OMB_PHONE_PUSH=1 or 0 wins over `features.phonePush` in config.json. */
-export function phonePushEnabled(cfg: { features?: { phonePush?: boolean } }, env: NodeJS.ProcessEnv = process.env): boolean {
+/** On when switched on (`OMB_PHONE_PUSH=1|0` wins over `features.phonePush`), or when local direct APNs is configured. */
+export function phonePushEnabled(
+  cfg: { features?: { phonePush?: boolean }; apns?: ApnsConfig },
+  env: NodeJS.ProcessEnv = process.env,
+): boolean {
   if (env[PHONE_PUSH_ENV] === "1") return true;
   if (env[PHONE_PUSH_ENV] === "0") return false;
-  return cfg.features?.phonePush === true;
+  if (cfg.features?.phonePush !== undefined) return cfg.features.phonePush === true;
+  return resolveApnsConfig(apnsConfigWithEnv(cfg.apns, env)) !== null;
+}
+
+export interface ApnsStatus {
+  enabled: boolean;
+  configured: boolean;
+  teamId: string;
+  keyId: string;
+  bundleId: string;
+  environment: ApnsEnvironment;
+  hasPrivateKey: boolean;
+  apnsDevices: number;
+  activityTokens: number;
+}
+
+export function apnsStatusFor(
+  cfg: { apns?: ApnsConfig },
+  counts: { apnsDevices: number; activityTokens: number } = { apnsDevices: 0, activityTokens: 0 },
+): ApnsStatus {
+  const apns = cfg.apns;
+  return {
+    enabled: apns?.enabled !== false,
+    configured: resolveApnsConfig(apns) !== null,
+    teamId: apns?.teamId?.trim().toUpperCase() ?? "",
+    keyId: apns?.keyId?.trim().toUpperCase() ?? "",
+    bundleId: apns?.bundleId?.trim() ?? "",
+    environment: apns?.environment === "production" ? "production" : "sandbox",
+    hasPrivateKey: Boolean(usableApnsPrivateKey(apns)),
+    apnsDevices: counts.apnsDevices,
+    activityTokens: counts.activityTokens,
+  };
 }
 
 const kindsSchema = z.array(z.enum(PUSH_KINDS)).max(PUSH_KINDS.length);
 
 export const registrationSchema = z.discriminatedUnion("platform", [
-  z.object({ platform: z.literal("apns"), token: z.string().trim().toLowerCase().regex(APNS_TOKEN), environment: z.enum(["production", "sandbox"]).default("production"), pairing: z.string().regex(PAIRING_TAG).optional(), kinds: kindsSchema.optional() }).strict(),
+  z.object({ platform: z.literal("apns"), token: z.string().trim().toLowerCase().regex(APNS_TOKEN), environment: z.enum(["production", "sandbox"]).optional(), pairing: z.string().regex(PAIRING_TAG).optional(), kinds: kindsSchema.optional() }).strict(),
   z.object({ platform: z.literal("fcm"), token: z.string().trim().regex(FCM_TOKEN), environment: z.literal("production").optional(), pairing: z.string().regex(PAIRING_TAG).optional(), kinds: kindsSchema.optional() }).strict(),
 ]);
 
@@ -86,8 +124,20 @@ const storedDevice = z.object({
   createdAt: z.number(),
   updatedAt: z.number(),
 }).refine((device) => validPushToken(device.platform, device.token));
-const storedFile = z.object({ version: z.literal(1), devices: z.array(storedDevice).max(MAX_PUSH_DEVICES) });
+const storedActivityToken = z.object({
+  key: z.string().regex(PUSH_DEVICE_KEY).optional(),
+  token: z.string().regex(APNS_TOKEN),
+  purpose: z.enum(["activity", "activity-start"]),
+  environment: z.enum(["production", "sandbox"]),
+  updatedAt: z.number(),
+});
+const storedFile = z.object({
+  version: z.literal(1),
+  devices: z.array(storedDevice).max(MAX_PUSH_DEVICES),
+  activityTokens: z.array(storedActivityToken).max(MAX_PUSH_DEVICES * 4).optional(),
+});
 type StoredDevice = z.infer<typeof storedDevice>;
+type StoredActivityToken = z.infer<typeof storedActivityToken>;
 
 export interface PhonePushAccess {
   controlPlane: string;
@@ -99,6 +149,8 @@ export type PushOutcome = "sent" | "dropped" | "stale" | "live" | "gone" | "fail
 export interface PhonePushOptions {
   dataDir: string;
   access: () => PhonePushAccess | null;
+  apns?: () => ResolvedApnsConfig | null;
+  apnsClient?: ApnsDirectClient;
   enabled: () => boolean;
   /** Whether this phone holds a live event stream right now. */
   live: (key: string) => boolean;
@@ -167,9 +219,11 @@ export function phonePushNotification(notification: PushableNotification, room?:
 
 export class PhonePush {
   private devices: StoredDevice[] = [];
+  private activityTokens: StoredActivityToken[] = [];
   private readonly file: string;
   private readonly now: () => number;
   private readonly fetchImpl: typeof fetch;
+  private readonly apnsClient: ApnsDirectClient;
   private readonly log: (line: string) => void;
   private readonly timers: NonNullable<PhonePushOptions["timers"]>;
   private readonly sent = new Map<string, number[]>();
@@ -185,6 +239,7 @@ export class PhonePush {
     this.file = join(options.dataDir, PHONE_PUSH_FILE);
     this.now = options.now ?? Date.now;
     this.fetchImpl = options.fetchImpl ?? fetch;
+    this.apnsClient = options.apnsClient ?? new ApnsDirectClient({ now: this.now });
     this.log = options.log ?? ((line) => console.log(line));
     this.timers = options.timers ?? {
       set: (run, ms) => setTimeout(run, ms).unref(),
@@ -197,18 +252,38 @@ export class PhonePush {
       return;
     }
     const parsed = storedFile.safeParse(raw);
-    if (parsed.success) this.devices = parsed.data.devices;
-    else this.log("[phone-push] the saved phone registrations could not be read; phones register again when they connect");
+    if (parsed.success) {
+      this.devices = parsed.data.devices;
+      this.activityTokens = parsed.data.activityTokens ?? [];
+    } else this.log("[phone-push] the saved phone registrations could not be read; phones register again when they connect");
   }
 
   private persist(): void {
     mkdirSync(dirname(this.file), { recursive: true, mode: 0o700 });
-    writeFileAtomic(this.file, `${JSON.stringify({ version: 1, devices: this.devices }, null, 2)}\n`, { mode: 0o600 });
+    const payload = {
+      version: 1,
+      devices: this.devices,
+      ...(this.activityTokens.length ? { activityTokens: this.activityTokens } : {}),
+    };
+    writeFileAtomic(this.file, `${JSON.stringify(payload, null, 2)}\n`, { mode: 0o600 });
   }
 
   status(): PhonePushState {
     if (!this.options.enabled()) return "off";
-    return this.options.access() ? "on" : "no-account";
+    return this.options.apns?.() || this.options.access() ? "on" : "no-account";
+  }
+
+  counts(): { apnsDevices: number; activityTokens: number } {
+    return {
+      apnsDevices: this.devices.filter((device) => device.platform === "apns").length,
+      activityTokens: this.activityTokens.length,
+    };
+  }
+
+  resetPause(): void {
+    this.pausedUntil = 0;
+    this.apnsClient.forgetToken();
+    this.schedule();
   }
 
   private publicDevice(key: string): PublicPushDevice | null {
@@ -223,12 +298,59 @@ export class PhonePush {
     return device ? { platform: device.platform, token: device.token, environment: device.environment } : undefined;
   }
 
+  defaultApnsEnvironment(): ApnsEnvironment {
+    return this.options.apns?.()?.defaultEnvironment ?? "production";
+  }
+
   isLive(key: string): boolean {
     return this.options.live(key);
   }
 
-  /** One relay call, as this server's installation; null when the relay could not be reached or there is no account. */
-  call(path: string, body: unknown): Promise<RelayAnswer | null> {
+  /** One relay or direct-APNs call, as this server's installation; null when unreachable or unconfigured. */
+  async call(path: string, body: unknown, key?: string): Promise<RelayAnswer | null> {
+    const record = body && typeof body === "object" ? body as Record<string, unknown> : null;
+    if (path === PHONE_PUSH_RELAY_PATHS.register && record?.platform === "apns" && typeof record.token === "string" && APNS_TOKEN.test(record.token)) {
+      const purpose = record.purpose === "activity" || record.purpose === "activity-start" ? record.purpose : null;
+      if (purpose) {
+        const environment: ApnsEnvironment = record.environment === "sandbox"
+          ? "sandbox"
+          : record.environment === "production"
+            ? "production"
+            : this.defaultApnsEnvironment();
+        this.activityTokens = [
+          ...this.activityTokens.filter((entry) => entry.token !== record.token).slice(-(MAX_PUSH_DEVICES * 4 - 1)),
+          { ...(key && PUSH_DEVICE_KEY.test(key) ? { key } : {}), token: record.token, purpose, environment, updatedAt: this.now() },
+        ];
+        this.persist();
+      }
+      if (this.options.apns?.()) return { status: 200 };
+    }
+    if (path === PHONE_PUSH_RELAY_PATHS.unregister && record?.platform === "apns" && typeof record.token === "string") {
+      const before = this.activityTokens.length;
+      this.activityTokens = this.activityTokens.filter((entry) => entry.token !== record.token);
+      if (this.activityTokens.length !== before) this.persist();
+      if (this.options.apns?.() && !this.options.access()) return { status: 204 };
+    }
+    if (path === PHONE_ACTIVITY_RELAY_PATH && record && typeof record.token === "string" && APNS_TOKEN.test(record.token)) {
+      const apns = this.options.apns?.();
+      if (apns) {
+        const phoneEnv = key ? this.devices.find((device) => device.key === key && device.platform === "apns")?.environment : undefined;
+        const known = phoneEnv
+          ?? this.activityTokens.find((entry) => entry.token === record.token)?.environment
+          ?? apns.defaultEnvironment;
+        const outcome = await this.apnsClient.sendActivity(apns, known, body as PushRelayActivityRequest);
+        if (outcome.kind === "sent") return { status: 202 };
+        if (outcome.kind === "dead") {
+          this.activityTokens = this.activityTokens.filter((entry) => entry.token !== record.token);
+          this.persist();
+          return { status: 410, code: PUSH_RELAY_ERRORS.unregistered };
+        }
+        if (outcome.kind === "throttled") return { status: 429, ...(outcome.retryAfterMs ? { retryAfterMs: outcome.retryAfterMs } : {}) };
+        if (outcome.kind === "credentials") return { status: 503, code: PUSH_RELAY_ERRORS.unavailable };
+        if (outcome.kind === "transient") return null;
+        return { status: outcome.status || 400, code: outcome.reason };
+      }
+    }
     return this.relay(path, body);
   }
 
@@ -251,16 +373,20 @@ export class PhonePush {
       key,
       platform: input.platform,
       token: input.token,
-      environment: input.platform === "apns" ? input.environment ?? "production" : "production",
+      environment: input.platform === "apns" ? input.environment ?? this.defaultApnsEnvironment() : "production",
       ...(input.pairing ? { pairing: input.pairing } : {}),
       kinds: [...new Set(input.kinds ?? PUSH_KINDS)],
       createdAt: previous?.createdAt ?? now,
       updatedAt: now,
     };
     this.devices = [...others, next];
+    if (next.platform === "apns") {
+      this.activityTokens = this.activityTokens.map((entry) => entry.key === key ? { ...entry, environment: next.environment } : entry);
+    }
     this.persist();
-    if (previous && previous.token !== next.token) this.dropFromRelay(previous);
+    if (previous && previous.token !== next.token) void this.dropFromRelay(previous);
     if (this.status() !== "on") return { ...this.answer(key), relay: "off" };
+    if (next.platform === "apns" && this.options.apns?.()) return { ...this.answer(key), relay: "registered" };
     const answer = await this.relay(PHONE_PUSH_RELAY_PATHS.register, this.registerBody(next));
     return { ...this.answer(key), relay: answer && answer.status < 300 ? "registered" : "pending" };
   }
@@ -283,6 +409,7 @@ export class PhonePush {
 
   private async dropFromRelay(device: StoredDevice): Promise<void> {
     if (this.devices.some((other) => other.token === device.token)) return;
+    if (device.platform === "apns" && this.options.apns?.() && !this.options.access()) return;
     await this.relay(PHONE_PUSH_RELAY_PATHS.unregister, { v: PHONE_PUSH_WIRE_VERSION, platform: device.platform, token: device.token });
   }
 
@@ -380,6 +507,32 @@ export class PhonePush {
     const recent = (this.sent.get(job.key) ?? []).filter((at) => now - at < PUSH_DEVICE_WINDOW_MS);
     if (recent.length >= PUSH_DEVICE_WINDOW_MAX) return "dropped";
     const body = { v: PHONE_PUSH_WIRE_VERSION, token: device.token, ...(device.pairing ? { pairing: device.pairing } : {}), ...(job.collapseId ? { collapseId: job.collapseId } : {}), notification: job.push };
+    const apns = device.platform === "apns" ? this.options.apns?.() : null;
+    if (apns) {
+      const outcome = await this.apnsClient.sendAlert(apns, device.environment, body);
+      if (outcome.kind === "sent") {
+        this.sent.set(job.key, [...recent, now]);
+        this.lastBySlot.set(job.slot, now);
+        if (this.lastBySlot.size > 2_000) this.lastBySlot.clear();
+        return "sent";
+      }
+      if (outcome.kind === "dead") {
+        if (outcome.status === 410 || outcome.reason === "Unregistered") {
+          this.devices = this.devices.filter((candidate) => candidate.token !== device.token);
+          this.persist();
+          return "gone";
+        }
+        this.log(`[phone-push] direct APNs rejected device token (${outcome.reason})`);
+        return "failed";
+      }
+      if (outcome.kind === "credentials") {
+        this.log(`[phone-push] direct APNs rejected signing credentials (${outcome.reason})`);
+        return this.pause(5 * 60_000);
+      }
+      if (outcome.kind === "throttled") return this.pause(outcome.retryAfterMs ?? 60_000);
+      if (outcome.kind === "transient") return "retry";
+      return "failed";
+    }
     let answer = await this.relay(PHONE_PUSH_RELAY_PATHS.send, body);
     if (answer?.status === 404 && answer.code === PUSH_RELAY_ERRORS.unknownDevice) {
       const registered = await this.relay(PHONE_PUSH_RELAY_PATHS.register, this.registerBody(device));
@@ -406,6 +559,57 @@ export class PhonePush {
   private pause(ms: number): PushOutcome {
     this.pausedUntil = Math.max(this.pausedUntil, this.now() + Math.min(Math.max(ms, 1_000), 6 * 60 * 60_000));
     return "paused";
+  }
+
+  async sendTest(target?: { botId: string; botName: string; threadId: string }): Promise<
+    | { ok: true; sent: number; total: number; reasons?: string[] }
+    | { ok: false; status: 409 | 502; error: string; reasons?: string[] }
+  > {
+    const apns = this.options.apns?.();
+    if (!apns) {
+      return { ok: false, status: 409, error: "Save your Team ID, Key ID, Bundle ID, and .p8 private key first." };
+    }
+    const devices = this.devices.filter((device) => device.platform === "apns");
+    if (!devices.length) {
+      return { ok: false, status: 409, error: "No paired iPhone has registered for notifications yet. Open MausBot on your paired iPhone once so it registers its device token." };
+    }
+    const sample = target ?? { botId: "mausbot", botName: "MausBot", threadId: "test_notification" };
+    const push: PhonePushNotification = {
+      kind: "done",
+      title: `${clip(sample.botName, PUSH_NAME_MAX) || "MausBot"} test notification`,
+      botId: PUSH_ID.test(sample.botId) ? sample.botId : "mausbot",
+      botName: clip(sample.botName, PUSH_NAME_MAX) || "MausBot",
+      threadId: PUSH_ID.test(sample.threadId) ? sample.threadId : "test_notification",
+    };
+    let sent = 0;
+    const reasons: string[] = [];
+    for (const device of devices) {
+      const outcome = await this.apnsClient.sendAlert(apns, device.environment, {
+        v: PHONE_PUSH_WIRE_VERSION,
+        token: device.token,
+        ...(device.pairing ? { pairing: device.pairing } : {}),
+        notification: push,
+      });
+      if (outcome.kind === "sent") {
+        sent += 1;
+        continue;
+      }
+      if (outcome.kind === "dead" && (outcome.status === 410 || outcome.reason === "Unregistered")) {
+        this.devices = this.devices.filter((candidate) => candidate.token !== device.token);
+        this.persist();
+      }
+      reasons.push(outcome.reason);
+    }
+    if (sent > 0) return { ok: true, sent, total: devices.length, ...(reasons.length ? { reasons } : {}) };
+    const first = reasons[0] ?? "UnknownError";
+    const hint = first === "DeviceTokenNotForTopic"
+      ? "Apple rejected the Bundle ID for this iPhone token (DeviceTokenNotForTopic). Check that Bundle ID matches the re-signed IPA."
+      : first === "BadDeviceToken"
+        ? "Apple rejected the device token (BadDeviceToken). Check whether the IPA was signed with a Sandbox (Development) or Production profile."
+        : first === "InvalidProviderToken" || first === "ExpiredProviderToken"
+          ? `Apple rejected the signing credentials (${first}). Check Team ID, Key ID, and the .p8 private key.`
+          : `Apple APNs rejected the test push (${first}).`;
+    return { ok: false, status: 502, error: hint, reasons };
   }
 
   /** One POST to the relay; null when it could not be reached. The credential travels only in the Authorization header,

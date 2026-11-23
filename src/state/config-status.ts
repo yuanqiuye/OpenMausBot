@@ -8,7 +8,19 @@ import type { ModelSelection } from "./store";
 /** A saved credential: whether it is set and, for admins, its last four characters. The key itself never comes back. */
 export interface SavedKey { configured: boolean; last4?: string }
 
-export type NestedKeyName = "ttsKey" | "fishAudioKey" | "geminiTtsKey" | "jevApiKey" | "openrouterDeciderKey" | "workersAiToken" | "customDeciderKey" | "openaiImageApiKey" | "customImageApiKey" | "openaiLiveKey" | "geminiImageApiKey";
+export type NestedKeyName = "ttsKey" | "fishAudioKey" | "geminiTtsKey" | "jevApiKey" | "openrouterDeciderKey" | "workersAiToken" | "customDeciderKey" | "openaiImageApiKey" | "customImageApiKey" | "openaiLiveKey" | "geminiImageApiKey" | "apnsPrivateKey";
+
+export interface ApnsStatusSummary {
+  enabled: boolean;
+  configured: boolean;
+  teamId: string;
+  keyId: string;
+  bundleId: string;
+  environment: "production" | "sandbox";
+  hasPrivateKey: boolean;
+  apnsDevices: number;
+  activityTokens: number;
+}
 
 export interface ImageSlotStatus { provider: ImageProvider; model: string; configured: boolean }
 
@@ -141,6 +153,8 @@ export interface ConfigStatus {
   };
   /** Live calls (OpenAI GPT-Live): configured-or-not, never the key. */
   live?: LiveSettings;
+  /** Local direct APNs credentials status for iOS alerts and Live Activity; never includes the .p8 private key. */
+  apns?: ApnsStatusSummary;
   /** Keys kept inside another setting (voice, decisions, pictures, live calls), by their desktop credential name. */
   savedKeys?: Partial<Record<NestedKeyName, SavedKey>>;
   imageGen?: {
