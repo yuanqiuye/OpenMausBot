@@ -28,8 +28,10 @@ import {
   buildNeedsYouAnswers,
   clipActivityStatus,
   detectPhoneLanguage,
+  extractActivityStep,
   formatCompletionStatus,
   formatProgressStep,
+  type ActivityStepInput,
 } from "./phone-activity-copy.ts";
 import { PUSH_DEVICE_KEY, type PhonePush } from "./phone-push.ts";
 
@@ -39,8 +41,9 @@ export const MAX_ACTIVITIES = 10;
 export const MAX_VISUALS = 60;
 export const DEFAULT_WORKING_START_DELAY_MS = 1_500;
 export const DEFAULT_ACTIVITY_PROGRESS_MS = 6_000;
-export const DEFAULT_COMPLETION_LINGER_MS = 45_000;
+export const DEFAULT_COMPLETION_LINGER_MS = 30_000;
 const STARTING_DEDUP_MS = 30_000;
+const PUSH_START_MATCH_WINDOW_MS = 10 * 60_000;
 const HEADLINE_MAX = 120;
 /** A notification kind that means a bot needs the person, as the ask the phone's content state names. */
 const ASK_OF_KIND: ReadonlyMap<string, ActivityAsk> = new Map([
@@ -49,7 +52,9 @@ const ASK_OF_KIND: ReadonlyMap<string, ActivityAsk> = new Map([
   ["sign-in", "signIn"],
   ["secret", "other"],
 ]);
-const DONE_KINDS: ReadonlySet<string> = new Set(["done", "turn-failed", "routine-failed", "incident"]);
+const DONE_KINDS: ReadonlySet<string> = new Set([
+  "done", "turn-failed", "routine-failed", "routine-deferred", "incident", "delegation-settled", "brief", "mention", "wait",
+]);
 
 const hex = z.string().regex(/^#[0-9A-Fa-f]{6}$/);
 const visualSchema = z.object({ color: hex, gradient: z.array(hex).min(1).max(4), body: z.string().regex(/^[a-z][a-z0-9-]{0,39}$/) }).strict();
@@ -70,6 +75,12 @@ export const activityRegistrationSchema = z.object({
     working: status,
     needsYou: z.object({ approval: status, question: status, signIn: status, other: status }).strict(),
   }).strict().optional(),
+}).strict();
+
+export const activityTokenAttachSchema = z.object({
+  token: z.string().trim().toLowerCase().regex(APNS_TOKEN),
+  activityId: z.string().trim().min(1).max(128).optional(),
+  botId: z.string().regex(PUSH_ID).optional(),
 }).strict();
 
 const storedSchema = z.object({ version: z.literal(1), phones: z.array(z.object({ key: z.string().regex(PUSH_DEVICE_KEY), registration: activityRegistrationSchema, updatedAt: z.number() })).max(MAX_ACTIVITY_PHONES) });
@@ -154,9 +165,12 @@ export class PhoneActivity {
   private readonly askThread = new Map<string, string>();
   private readonly askKind = new Map<string, ActivityAsk>();
   private readonly askSummary = new Map<string, string>();
-  private readonly stepRaw = new Map<string, { activity: string; target?: string; file?: string; tool?: string }>();
+  private readonly stepRaw = new Map<string, ActivityStepInput>();
   private readonly doneSummary = new Map<string, DoneSummary>();
   private readonly startingUntil = new Map<string, number>();
+  private readonly pushedWorkingTurn = new Map<string, number>();
+  private readonly pendingPushStarts = new Map<string, Array<{ botId: string; at: number }>>();
+  private readonly serverAttachedActivities = new Map<string, { botId: string; token: string; at: number }>();
   private readonly lastProgressAt = new Map<string, number>();
   private readonly lastStatusSent = new Map<string, string>();
   private readonly workingStartTimers = new Map<string, ScheduledTimer>();
@@ -206,10 +220,34 @@ export class PhoneActivity {
   async register(key: string, input: z.infer<typeof activityRegistrationSchema>): Promise<"off" | "saved"> {
     if (!PUSH_DEVICE_KEY.test(key)) throw new Error("not a phone");
     if (this.options.push.status() === "off") return "off";
+    const now = this.now();
     const previous = this.phones.find((phone) => phone.key === key);
     const others = this.phones.filter((phone) => phone.key !== key);
     if (!previous && others.length >= MAX_ACTIVITY_PHONES) throw Object.assign(new Error("Too many phones"), { status: 409 });
-    this.phones = [...others, { key, registration: input, updatedAt: this.now() }];
+
+    const explicitActivities = [...(input.activities ?? [])];
+    const explicitBotIds = new Set(explicitActivities.map(({ botId }) => botId));
+    const prefix = `${key}|`;
+    for (const [slotKey, attached] of Array.from(this.serverAttachedActivities.entries())) {
+      if (!slotKey.startsWith(prefix)) continue;
+      if (explicitBotIds.has(attached.botId) || this.options.push.isLive(key)) {
+        this.serverAttachedActivities.delete(slotKey);
+        continue;
+      }
+      const keepActive = this.bots.has(attached.botId)
+        || this.lingerTimers.has(slotKey)
+        || (this.doneSummary.get(attached.botId)?.at ?? 0) > now - 60_000;
+      if (keepActive && explicitActivities.length < MAX_ACTIVITIES) {
+        explicitActivities.push({ botId: attached.botId, token: attached.token });
+      } else {
+        this.serverAttachedActivities.delete(slotKey);
+      }
+    }
+    const effectiveInput: z.infer<typeof activityRegistrationSchema> = explicitActivities.length
+      ? { ...input, activities: explicitActivities }
+      : input;
+
+    this.phones = [...others, { key, registration: effectiveInput, updatedAt: now }];
     this.persist();
     const environment = this.options.push.deviceOf(key)?.environment ?? this.options.push.defaultApnsEnvironment();
     const tokens = (registration: PhoneActivityRegistration | undefined) => new Map<string, "activity" | "activity-start">([
@@ -217,7 +255,7 @@ export class PhoneActivity {
       ...(registration?.activities ?? []).map(({ token }) => [token, "activity"] as const),
     ]);
     const before = tokens(previous?.registration);
-    const after = tokens(input);
+    const after = tokens(effectiveInput);
     for (const token of before.keys()) {
       if (!after.has(token)) void this.options.push.call(PHONE_PUSH_RELAY_PATHS.unregister, { v: PHONE_PUSH_WIRE_VERSION, platform: "apns", token }, key);
     }
@@ -227,15 +265,15 @@ export class PhoneActivity {
       }
     }
     // The phone said which activities it holds: anything it no longer lists is not on screen.
-    const listed = new Set((input.activities ?? []).map(({ botId }) => botId));
+    const listed = new Set((effectiveInput.activities ?? []).map(({ botId }) => botId));
     const shown = this.shown.get(key);
-    if (shown) for (const botId of shown.keys()) if (!listed.has(botId) && !input.ongoing) shown.delete(botId);
+    if (shown) for (const botId of shown.keys()) if (!listed.has(botId) && !effectiveInput.ongoing) shown.delete(botId);
 
     if (this.hasDirectApns() && !this.options.push.isLive(key)) {
       const prevTokens = new Map((previous?.registration.activities ?? []).map(({ botId, token }) => [botId, token]));
       const storedPhone = this.phones.find((candidate) => candidate.key === key);
       if (storedPhone) {
-        for (const { botId, token } of input.activities ?? []) {
+        for (const { botId, token } of effectiveInput.activities ?? []) {
           const slotKey = `${key}|${botId}`;
           const wasStarting = (this.startingUntil.get(slotKey) ?? 0) > this.now();
           this.startingUntil.delete(slotKey);
@@ -244,7 +282,7 @@ export class PhoneActivity {
           const reaches = this.reach.get(botId);
           if (reaches && !reaches(key)) continue;
           const current = this.bots.get(botId);
-          const wanted = current && (input.kinds ?? ["needsYou", "working"]).includes(current.kind) ? current.kind : undefined;
+          const wanted = current && (effectiveInput.kinds ?? ["needsYou", "working"]).includes(current.kind) ? current.kind : undefined;
           if (wanted) {
             const nextShown = this.shown.get(key) ?? new Map<string, ActivityKind>();
             this.shown.set(key, nextShown);
@@ -259,11 +297,111 @@ export class PhoneActivity {
     return "saved";
   }
 
+  /** Attaches an APNs per-activity token minted on iOS after a push-to-start wake without overwriting other activities. */
+  async attachPushStartedToken(
+    key: string,
+    input: z.infer<typeof activityTokenAttachSchema>,
+  ): Promise<"off" | "unregistered" | "ignored" | "attached"> {
+    if (!PUSH_DEVICE_KEY.test(key)) throw new Error("not a phone");
+    if (this.options.push.status() === "off") return "off";
+    const phone = this.phones.find((candidate) => candidate.key === key);
+    if (!phone) return "unregistered";
+    const now = this.now();
+    const existingActivities = phone.registration.activities ?? [];
+    const existingBotIds = new Set(existingActivities.map((entry) => entry.botId));
+
+    let targetBotId = input.botId;
+    const pendingQueue = (this.pendingPushStarts.get(key) ?? []).filter((item) => now - item.at < PUSH_START_MATCH_WINDOW_MS);
+    if (!targetBotId) {
+      const exactIdx = pendingQueue.findIndex((item) => !existingBotIds.has(item.botId));
+      const pickedIdx = exactIdx >= 0 ? exactIdx : (pendingQueue.length ? 0 : -1);
+      if (pickedIdx >= 0) {
+        targetBotId = pendingQueue[pickedIdx]!.botId;
+        pendingQueue.splice(pickedIdx, 1);
+      }
+    } else {
+      const idx = pendingQueue.findIndex((item) => item.botId === targetBotId);
+      if (idx >= 0) pendingQueue.splice(idx, 1);
+    }
+    if (pendingQueue.length) this.pendingPushStarts.set(key, pendingQueue);
+    else this.pendingPushStarts.delete(key);
+
+    if (!targetBotId) {
+      for (const candidateBotId of this.bots.keys()) {
+        if (existingBotIds.has(candidateBotId)) continue;
+        const reaches = this.reach.get(candidateBotId);
+        if (!reaches || reaches(key)) {
+          targetBotId = candidateBotId;
+          break;
+        }
+      }
+    }
+    if (!targetBotId) {
+      for (const [candidateBotId, summary] of this.doneSummary.entries()) {
+        if (now - summary.at > 60_000 || existingBotIds.has(candidateBotId)) continue;
+        const reaches = this.reach.get(candidateBotId);
+        if (!reaches || reaches(key)) {
+          targetBotId = candidateBotId;
+          break;
+        }
+      }
+    }
+    if (!targetBotId) return "ignored";
+
+    const slotKey = `${key}|${targetBotId}`;
+    const prevToken = existingActivities.find((entry) => entry.botId === targetBotId)?.token;
+    this.serverAttachedActivities.set(slotKey, { botId: targetBotId, token: input.token, at: now });
+    this.startingUntil.delete(slotKey);
+    this.clearSlotTimer(this.workingStartTimers, slotKey);
+
+    if (prevToken !== input.token) {
+      const filtered = existingActivities.filter((entry) => entry.botId !== targetBotId && entry.token !== input.token);
+      const nextActivities = [...filtered, { botId: targetBotId, token: input.token }].slice(-MAX_ACTIVITIES);
+      phone.registration = { ...phone.registration, activities: nextActivities };
+      phone.updatedAt = now;
+      this.persist();
+      if (prevToken) {
+        void this.options.push.call(PHONE_PUSH_RELAY_PATHS.unregister, { v: PHONE_PUSH_WIRE_VERSION, platform: "apns", token: prevToken }, key);
+      }
+      const environment = this.options.push.deviceOf(key)?.environment ?? this.options.push.defaultApnsEnvironment();
+      await this.options.push.call(
+        PHONE_PUSH_RELAY_PATHS.register,
+        { v: PHONE_PUSH_WIRE_VERSION, platform: "apns", purpose: "activity", token: input.token, environment },
+        key,
+      );
+    }
+
+    if (this.hasDirectApns() && !this.options.push.isLive(key)) {
+      const reaches = this.reach.get(targetBotId);
+      if (!reaches || reaches(key)) {
+        const current = this.bots.get(targetBotId);
+        const wanted = current && (phone.registration.kinds ?? ["needsYou", "working"]).includes(current.kind) ? current.kind : undefined;
+        if (wanted) {
+          const nextShown = this.shown.get(key) ?? new Map<string, ActivityKind>();
+          this.shown.set(key, nextShown);
+          nextShown.set(targetBotId, wanted);
+          this.enqueue(phone, targetBotId, wanted, wanted);
+        } else {
+          this.enqueueCompletion(phone, targetBotId);
+        }
+      }
+    }
+    return "attached";
+  }
+
   async remove(key: string): Promise<void> {
     const previous = this.phones.find((phone) => phone.key === key);
     if (!previous) return;
     this.phones = this.phones.filter((phone) => phone.key !== key);
     this.shown.delete(key);
+    this.pendingPushStarts.delete(key);
+    const prefix = `${key}|`;
+    for (const slotKey of this.pushedWorkingTurn.keys()) {
+      if (slotKey.startsWith(prefix)) this.pushedWorkingTurn.delete(slotKey);
+    }
+    for (const slotKey of this.serverAttachedActivities.keys()) {
+      if (slotKey.startsWith(prefix)) this.serverAttachedActivities.delete(slotKey);
+    }
     this.clearKeyTimers(key);
     this.persist();
     const tokens = [previous.registration.startToken, ...(previous.registration.activities ?? []).map(({ token }) => token)].filter((token): token is string => Boolean(token));
@@ -407,7 +545,7 @@ export class PhoneActivity {
           this.askKind.set(botId, mapped);
         }
       } else if (isProgress) {
-        const extracted = this.extractStep(event);
+        const extracted = extractActivityStep(event);
         if (!extracted) return null;
         const prev = this.stepRaw.get(botId);
         if (prev && prev.activity === extracted.activity && prev.target === extracted.target && prev.file === extracted.file && prev.tool === extracted.tool) {
@@ -416,30 +554,6 @@ export class PhoneActivity {
         this.stepRaw.set(botId, extracted);
       }
       return botId;
-    }
-    return null;
-  }
-
-  private extractStep(event: Record<string, unknown>): { activity: string; target?: string; file?: string; tool?: string } | null {
-    if (event.type === "turn.progress" && typeof event.activity === "string") {
-      return {
-        activity: event.activity,
-        ...(typeof event.target === "string" && event.target ? { target: event.target } : {}),
-        ...(typeof event.file === "string" && event.file ? { file: event.file } : {}),
-        ...(typeof event.tool === "string" && event.tool ? { tool: event.tool } : {}),
-      };
-    }
-    if (event.type === "item.started" && event.itemType === "tool") {
-      const step = event.step && typeof event.step === "object" ? event.step as Record<string, unknown> : null;
-      if (step && typeof step.activity === "string") {
-        return {
-          activity: step.activity,
-          ...(typeof step.target === "string" && step.target ? { target: step.target } : {}),
-        };
-      }
-      if (typeof event.title === "string" && event.title.trim()) {
-        return { activity: "tool", target: event.title.trim() };
-      }
     }
     return null;
   }
@@ -485,12 +599,18 @@ export class PhoneActivity {
 
         if (wanted) {
           this.clearSlotTimer(this.lingerTimers, slotKey);
+          if (wanted === "needsYou") this.pushedWorkingTurn.delete(slotKey);
         } else {
+          this.pushedWorkingTurn.delete(slotKey);
           this.clearSlotTimer(this.workingStartTimers, slotKey);
           this.clearSlotTimer(this.progressTimers, slotKey);
         }
 
         if (wanted === "working" && !was && directApns && !running && phone.registration.startToken && !phone.registration.ongoing) {
+          const currentSince = this.bots.get(botId)?.since;
+          if (currentSince !== undefined && this.pushedWorkingTurn.get(slotKey) === currentSince) {
+            continue;
+          }
           if (!this.workingStartTimers.has(slotKey) && now >= (this.startingUntil.get(slotKey) ?? 0)) {
             const delay = this.options.workingStartDelayMs ?? DEFAULT_WORKING_START_DELAY_MS;
             this.setSlotTimer(this.workingStartTimers, slotKey, delay, () => this.fireWorkingStart(phone.key, botId));
@@ -533,6 +653,7 @@ export class PhoneActivity {
     const slotKey = `${key}|${botId}`;
     const now = this.now();
     if (!running && !phone.registration.startToken) return;
+    if (!running && this.pushedWorkingTurn.get(slotKey) === state.since) return;
     if (!running && now < (this.startingUntil.get(slotKey) ?? 0)) return;
     const shown = this.shown.get(key) ?? new Map<string, ActivityKind>();
     this.shown.set(key, shown);
@@ -786,7 +907,8 @@ export class PhoneActivity {
       }
     } else if ((newlyNeedsYou || newlyWorking) && registration.startToken) {
       const now = this.now();
-      if (!directApns || now >= (this.startingUntil.get(slotKey) ?? 0)) {
+      const alreadyPushedTurn = newlyWorking && state !== undefined && this.pushedWorkingTurn.get(slotKey) === state.since;
+      if (!alreadyPushedTurn && (!directApns || now >= (this.startingUntil.get(slotKey) ?? 0))) {
         if (directApns) this.startingUntil.set(slotKey, now + STARTING_DEDUP_MS);
         const startReq: DirectApnsActivityRequest = {
           v: PHONE_PUSH_WIRE_VERSION,
@@ -799,6 +921,13 @@ export class PhoneActivity {
         const sent = await this.post(currentPhone.key, botId, startReq, "apns");
         outcomes.push(sent);
         if (sent.result === "sent") {
+          if (newlyWorking && state !== undefined) this.pushedWorkingTurn.set(slotKey, state.since);
+          if (directApns) {
+            const pendingQueue = (this.pendingPushStarts.get(currentPhone.key) ?? [])
+              .filter((item) => now - item.at < PUSH_START_MATCH_WINDOW_MS && item.botId !== botId);
+            pendingQueue.push({ botId, at: now });
+            this.pendingPushStarts.set(currentPhone.key, pendingQueue);
+          }
           this.lastProgressAt.set(slotKey, now);
           this.lastStatusSent.set(slotKey, activity.status ?? activity.headline);
         } else {
@@ -841,6 +970,7 @@ export class PhoneActivity {
   }
 
   private dropActivity(key: string, botId: string): void {
+    this.serverAttachedActivities.delete(`${key}|${botId}`);
     const phone = this.phones.find((candidate) => candidate.key === key);
     const activities = phone?.registration.activities;
     if (!phone || !activities?.some((entry) => entry.botId === botId)) return;

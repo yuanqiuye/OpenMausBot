@@ -378,7 +378,7 @@ describe("pushing a bot's activity while the app is closed", () => {
       { label: "前往核准", link: "openmausbot://chat/th_1?focus=approval", refusal: false },
     ]);
 
-    // 5. Turn completion shows idle checkmark (`✓`) with reply summary for 45s, then ends cleanly.
+    // 5. Turn completion shows idle checkmark (`✓`) with reply summary for 30s, then ends cleanly.
     openAsks.delete("bot_1");
     bots.set("bot_1", { name: "Scout", busy: false, threadId: "th_1" });
     activity.offer({
@@ -395,10 +395,138 @@ describe("pushing a bot's activity while the app is closed", () => {
       status: "已完成 · 全部測試皆已通過",
     });
 
-    clock += 45_500;
+    clock += 29_000;
+    await activity.flushNow();
+    expect(apnsCalls).toHaveLength(5);
+
+    clock += 1_500;
     await activity.flushNow();
     expect(apnsCalls).toHaveLength(6);
     expect(JSON.parse(apnsCalls[5]!.body).aps.event).toBe("end");
+    expect(activity.registration(IPHONE)?.activities).toEqual([]);
+  });
+
+  it("attaches a background push-started token via POST, preserves it across empty background PUTs without re-flashing startToken, and lingers 30s on brief/routine completion", async () => {
+    const { privateKey } = generateKeyPairSync("ec", { namedCurve: "prime256v1" });
+    const privateKeyPem = String(privateKey.export({ type: "pkcs8", format: "pem" })).trim();
+    const resolved = resolveApnsConfig({
+      teamId: "TEAM123456",
+      keyId: "KEY1234567",
+      bundleId: "com.example.mausbot",
+      privateKey: privateKeyPem,
+      environment: "sandbox",
+      includePreview: true,
+    })!;
+    let clock = 2_000_000;
+    const apnsCalls: ApnsRawRequest[] = [];
+    const apnsClient = new ApnsDirectClient({
+      now: () => clock,
+      transport: async (req) => {
+        apnsCalls.push(req);
+        return { status: 200, apnsId: `apns-bg-${apnsCalls.length}`, body: "" };
+      },
+    });
+    const push = new PhonePush({
+      dataDir,
+      access: () => null,
+      apns: () => resolved,
+      apnsClient,
+      enabled: () => true,
+      live: () => false,
+      room: () => undefined,
+      threadTitle: () => "九點打卡簽到",
+      now: () => clock,
+      log: () => {},
+    });
+    const bots = new Map([["bot_1", { name: "MausBot", busy: false, threadId: "th_1" }]]);
+    const activity = new PhoneActivity({
+      dataDir,
+      push,
+      hasOpenAsk: () => false,
+      bot: (botId) => bots.get(botId),
+      botOfThread: () => "bot_1",
+      now: () => clock,
+      log: () => {},
+      timers: { set: () => ({}), clear: () => {} },
+    });
+
+    await push.register(IPHONE, { platform: "apns", token: "ab".repeat(32), environment: "sandbox" });
+    const baseReg = {
+      scheme: "openmausbot" as const,
+      headlines: { needsYou: "{name} 需要你處理", working: "{name} 正在處理" },
+      statuses: {
+        working: "處理中",
+        needsYou: { approval: "等待你核准", question: "有個問題想問你", signIn: "需要你登入", other: "需要你處理" },
+      },
+      startToken: START,
+      visuals: { bot_1: VISUAL },
+    };
+    await activity.register(IPHONE, activityRegistrationSchema.parse(baseReg));
+
+    // Scheduled turn starts -> 1.5s later Mac sends exactly one push-to-start.
+    bots.set("bot_1", { name: "MausBot", busy: true, threadId: "th_1" });
+    activity.offer(runtime("turn.started"), everyone);
+    await activity.flushNow();
+    clock += 1_600;
+    await activity.flushNow();
+    expect(apnsCalls).toHaveLength(1);
+    expect(apnsCalls[0]!.path).toBe(`/3/device/${START}`);
+    expect(JSON.parse(apnsCalls[0]!.body).aps.event).toBe("start");
+
+    // Step progress arrives before ActivityKit finishes minting per-activity token.
+    clock += 800;
+    activity.offer({
+      kind: "runtime",
+      event: { type: "turn.progress", threadId: "th_1", activity: "fetch", target: "portal.nueip.com" },
+    }, everyone);
+    await activity.flushNow();
+
+    // iOS background bridge POSTs the newly minted push-started token -> immediately receives step update.
+    expect(await activity.attachPushStartedToken(IPHONE, { token: ACT, activityId: "act-uuid-1" })).toBe("attached");
+    await activity.flushNow();
+    expect(apnsCalls).toHaveLength(2);
+    expect(apnsCalls[1]!.path).toBe(`/3/device/${ACT}`);
+    expect(JSON.parse(JSON.parse(apnsCalls[1]!.body).aps["content-state"].props)).toMatchObject({
+      kind: "working",
+      status: "擷取網頁 · portal.nueip.com",
+    });
+
+    // Unpatched JS coordinator sends PUT /api/push/activity with activities: [] after 35s (> 30s dedup window):
+    // server preserves ACT and NEVER sends a second push-to-start for this turn.
+    clock += 35_000;
+    await activity.register(IPHONE, activityRegistrationSchema.parse({ ...baseReg, activities: [] }));
+    activity.offer({
+      kind: "runtime",
+      event: { type: "turn.progress", threadId: "th_1", activity: "command", target: "submit-checkin" },
+    }, everyone);
+    await activity.flushNow();
+    expect(apnsCalls.filter((call) => call.path === `/3/device/${START}`)).toHaveLength(1);
+    expect(apnsCalls).toHaveLength(3);
+    expect(apnsCalls[2]!.path).toBe(`/3/device/${ACT}`);
+    expect(JSON.parse(JSON.parse(apnsCalls[2]!.body).aps["content-state"].props)).toMatchObject({
+      kind: "working",
+      status: "執行 · submit-checkin",
+    });
+
+    // Routine brief completion transitions Dynamic Island to `✓ 已完成` for 30s, then ends cleanly.
+    clock += 10_000;
+    bots.set("bot_1", { name: "MausBot", busy: false, threadId: "th_1" });
+    activity.offer({
+      kind: "notify",
+      notification: { kind: "brief", botId: "bot_1", botName: "MausBot", threadId: "th_1", title: "MausBot 已完成", body: "09:01 已完成簽到打卡" },
+    }, everyone);
+    await activity.flushNow();
+    expect(apnsCalls).toHaveLength(4);
+    expect(JSON.parse(JSON.parse(apnsCalls[3]!.body).aps["content-state"].props)).toMatchObject({
+      kind: "idle",
+      mood: "idle",
+      status: "已完成 · 09:01 已完成簽到打卡",
+    });
+
+    clock += 30_500;
+    await activity.flushNow();
+    expect(apnsCalls).toHaveLength(5);
+    expect(JSON.parse(apnsCalls[4]!.body).aps.event).toBe("end");
     expect(activity.registration(IPHONE)?.activities).toEqual([]);
   });
 });

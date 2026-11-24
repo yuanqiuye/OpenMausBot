@@ -2,6 +2,7 @@ import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import vm from "node:vm";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   buildSigningEntitlements,
@@ -90,6 +91,7 @@ describe.runIf(process.platform === "darwin")("resign-ipa-apns bundle patcher", 
     expect(widgetsInfo.CFBundleIdentifier).toBe("com.example.mausbot.widgets");
     expect(widgetsInfo.ExpoWidgetsAppGroupIdentifier).toBe("group.com.example.mausbot");
     expect(existsSync(join(appDir, "PlugIns", "expo-sharing-extension.appex"))).toBe(false);
+    expect(existsSync(join(appDir, "OmbRuntimePatch.js"))).toBe(true);
 
     expect(() => patchExtractedAppBundle(appDir, {
       teamId: "AB12CD34EF",
@@ -270,5 +272,99 @@ describe.runIf(process.platform === "darwin")("resign-ipa-apns bundle patcher", 
 
     const otoolOut = execFileSync("/usr/bin/otool", ["-L", bin], { encoding: "utf8" });
     expect(otoolOut).toContain("@executable_path/Frameworks/OmbNotificationAvatar.dylib");
+  });
+
+  it("guards background LiveActivity.end() calls and relays push-started tokens in OmbRuntimePatch.js", async () => {
+    const patchSource = readFileSync(new URL("./OmbRuntimePatch.js", import.meta.url), "utf8");
+    let currentAppState = "background";
+    const bridgeRequests: string[] = [];
+    let endedCount = 0;
+
+    class MockNativeLiveActivity {
+      id: string;
+      private token: string | null;
+      constructor(id: string, token: string | null) {
+        this.id = id;
+        this.token = token;
+      }
+      end() {
+        endedCount += 1;
+        return Promise.resolve();
+      }
+      getPushToken() {
+        return Promise.resolve(this.token);
+      }
+      addListener() {
+        return { remove: () => {} };
+      }
+    }
+
+    const pushStarted = new MockNativeLiveActivity("push-act-1", "AA".repeat(40));
+    const instances = [pushStarted];
+    const sandbox: Record<string, unknown> = {
+      Date,
+      Promise,
+      Set,
+      Map,
+      Array,
+      Object,
+      Proxy,
+      Reflect,
+      encodeURIComponent,
+      setTimeout,
+      clearTimeout,
+      setInterval: () => 1,
+      fetch: (url: string) => {
+        bridgeRequests.push(url);
+        return Promise.resolve({});
+      },
+      __turboModuleProxy: (name: string) => (name === "AppState" ? {
+        getConstants: () => ({ initialAppState: currentAppState }),
+        getCurrentAppState: (ok: (res: { app_state: string }) => void) => ok({ app_state: currentAppState }),
+      } : null),
+      expo: {
+        modules: {
+          ExpoWidgets: {
+            LiveActivityFactory: {
+              start: () => {
+                const local = new MockNativeLiveActivity("local-act-1", "BB".repeat(40));
+                instances.push(local);
+                return local;
+              },
+              getInstances: () => instances,
+            },
+          },
+        },
+      },
+    };
+    sandbox.globalThis = sandbox;
+    sandbox.global = sandbox;
+
+    vm.runInNewContext(patchSource, sandbox);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    // Push-started instance reports wake + hex token, while background end("immediate") is blocked.
+    expect(bridgeRequests).toEqual([
+      "https://omb-runtime-bridge.invalid/activity-wake?id=push-act-1",
+      `https://omb-runtime-bridge.invalid/activity-token?id=push-act-1&token=${"aa".repeat(40)}`,
+    ]);
+    await pushStarted.end();
+    expect(endedCount).toBe(0);
+
+    // Entering foreground and starting a local replacement flushes deferred immediate end cleanly.
+    currentAppState = "active";
+    const factory = ((sandbox.expo as { modules: { ExpoWidgets: { LiveActivityFactory: { start: () => MockNativeLiveActivity } } } }).modules.ExpoWidgets.LiveActivityFactory);
+    const endPromise = (pushStarted as { end: (policy?: string) => Promise<void> }).end("immediate");
+    expect(endedCount).toBe(0);
+    const localStarted = factory.start();
+    await endPromise;
+    expect(endedCount).toBe(1);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(bridgeRequests.some((url) => url.includes("local-act-1"))).toBe(false);
+
+    // Foreground default end after initial transition window executes immediately.
+    (sandbox.__ombLiveActivityGuard as { activeSinceMs: number }).activeSinceMs = Date.now() - 5_000;
+    await (localStarted as { end: (policy?: string) => Promise<void> }).end("default");
+    expect(endedCount).toBe(2);
   });
 });

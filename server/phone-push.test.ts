@@ -646,5 +646,25 @@ describe("local direct APNs mode", () => {
     expect(privatePayload.aps.alert).toEqual({ title: "Scout finished" });
     expect(JSON.stringify(privatePayload)).not.toContain("Sensitive body");
     expect(JSON.stringify(privatePayload)).not.toContain("Deploy iOS build");
+
+    includePreview = true;
+    const relaySendsBefore = relay.calls.filter((call) => call.path.endsWith("/send")).length;
+    for (const [idx, kind] of ["brief", "routine-deferred", "delegation-settled", "spend", "notice"].entries()) {
+      clock += 15_000;
+      push.offer({
+        seq: 20 + idx,
+        notification: {
+          kind,
+          botId: "bot_1",
+          botName: "Scout",
+          threadId: `th_${kind}`,
+          title: `Scout ${kind}`,
+          body: `Summary for ${kind}`,
+        },
+      }, everyone);
+      await push.flush();
+    }
+    expect(apnsCalls).toHaveLength(7);
+    expect(relay.calls.filter((call) => call.path.endsWith("/send"))).toHaveLength(relaySendsBefore);
   });
 });

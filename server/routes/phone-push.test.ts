@@ -9,10 +9,11 @@ import { afterEach, describe, expect, it } from "vitest";
 import { apnsSavePatch, resolveApnsConfig, type ApnsConfig } from "../apns-config.ts";
 import { ApnsDirectClient } from "../apns-direct.ts";
 import { json, readBody } from "../harness/http.ts";
+import { PhoneActivity } from "../phone-activity.ts";
 import { apnsStatusFor, PhonePush } from "../phone-push.ts";
 import type { RequestAuth } from "../request-auth.ts";
 import { removeTempDir } from "../testing/cleanup.ts";
-import { createPhoneApnsRoutes, createPhonePushRoutes } from "./phone-push.ts";
+import { createPhoneActivityRoutes, createPhoneApnsRoutes, createPhonePushRoutes } from "./phone-push.ts";
 import { dispatchRoutes } from "./table.ts";
 
 const servers: Server[] = [];
@@ -210,5 +211,82 @@ describe("/api/push/apns", () => {
     const cloudBase = `http://127.0.0.1:${(cloudServer.address() as AddressInfo).port}`;
     expect((await fetch(`${cloudBase}/api/push/apns`)).status).toBe(403);
     expect((await fetch(`${cloudBase}/api/push/apns/test`, { method: "POST" })).status).toBe(403);
+  });
+});
+
+describe("/api/push/activity POST token attachment", () => {
+  it("attaches a push-started activity token for a paired phone without echoing tokens", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "phone-activity-routes-"));
+    dirs.push(dir);
+    const { privateKey } = generateKeyPairSync("ec", { namedCurve: "prime256v1" });
+    const resolved = resolveApnsConfig({
+      teamId: "TEAM123456",
+      keyId: "KEY1234567",
+      bundleId: "com.example.mausbot",
+      privateKey: String(privateKey.export({ type: "pkcs8", format: "pem" })).trim(),
+      environment: "sandbox",
+    })!;
+    const apnsClient = new ApnsDirectClient({
+      transport: async () => ({ status: 200, apnsId: "act-route-1", body: "" }),
+    });
+    const push = new PhonePush({
+      dataDir: dir,
+      access: () => null,
+      apns: () => resolved,
+      apnsClient,
+      enabled: () => true,
+      live: () => false,
+      room: () => undefined,
+      log: () => {},
+    });
+    const activity = new PhoneActivity({
+      dataDir: dir,
+      push,
+      hasOpenAsk: () => false,
+      bot: () => ({ name: "Scout", busy: true, threadId: "th_1" }),
+      botOfThread: () => "bot_1",
+      log: () => {},
+      timers: { set: () => ({}), clear: () => {} },
+    });
+    let auth: RequestAuth = session("iphone-1");
+    const routes = [createPhoneActivityRoutes({ push, activity, live: () => true })];
+    const server = createServer(async (req, res) => {
+      const url = new URL(req.url ?? "/", "http://localhost");
+      const handled = await dispatchRoutes(routes, { req, res, url, path: url.pathname, method: req.method ?? "GET", auth, json, readBody });
+      if (!handled) json(res, 404, { from: "elsewhere" });
+    });
+    servers.push(server);
+    await new Promise<void>((ready) => server.listen(0, "127.0.0.1", ready));
+    const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+    const call = async (method: string, body?: unknown) => {
+      const response = await fetch(`${base}/api/push/activity`, {
+        method,
+        headers: body === undefined ? {} : { "content-type": "application/json" },
+        ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+      });
+      return { status: response.status, body: await response.json() as Record<string, unknown> };
+    };
+
+    const startTok = "5a".repeat(40);
+    const actTok = "bc".repeat(40);
+    await call("PUT", {
+      scheme: "openmausbot",
+      headlines: { needsYou: "{name} needs you", working: "{name} is working" },
+      startToken: startTok,
+    });
+    activity.offer({ kind: "bot", bot: { id: "bot_1" } }, () => true);
+    await activity.flushNow();
+
+    expect((await call("POST", { token: "not-hex" })).status).toBe(400);
+    const attached = await call("POST", { token: actTok, activityId: "act-123", botId: "bot_1" });
+    expect(attached.status).toBe(200);
+    expect(attached.body).toMatchObject({
+      push: "on",
+      activity: { activities: ["bot_1"], canStart: true },
+    });
+    expect(JSON.stringify(attached.body)).not.toContain(actTok);
+
+    auth = desktop;
+    expect((await call("POST", { token: actTok })).status).toBe(403);
   });
 });

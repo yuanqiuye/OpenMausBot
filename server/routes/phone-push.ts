@@ -3,7 +3,7 @@
 import { z } from "zod";
 import { PHONE_ACTIVITY_ROUTE, PHONE_PUSH_ROUTE } from "../../shared/phone-push.ts";
 import { validateApnsFields, type ApnsSaveInput } from "../apns-config.ts";
-import { activityRegistrationSchema, type PhoneActivity } from "../phone-activity.ts";
+import { activityRegistrationSchema, activityTokenAttachSchema, type PhoneActivity } from "../phone-activity.ts";
 import { registrationSchema, type ApnsStatus, type PhonePush } from "../phone-push.ts";
 import { ownerOrAdmin, type RequestAuth } from "../request-auth.ts";
 import { phoneKey } from "./phones.ts";
@@ -75,6 +75,19 @@ export function createPhoneActivityRoutes(deps: PhoneActivityRouteDeps): RouteHa
     if (method === "DELETE") {
       await deps.activity.remove(key);
       return json(res, 200, answer());
+    }
+    if (method === "POST") {
+      if (!/^application\/json\b/i.test(String(req.headers["content-type"] ?? ""))) return json(res, 415, { error: "JSON required" });
+      const parsed = activityTokenAttachSchema.safeParse(await readBody(req, 8_192));
+      if (!deps.live(auth)) return json(res, 401, { error: "Session expired" });
+      if (!parsed.success) return json(res, 400, { error: "Invalid activity token" });
+      try {
+        await deps.activity.attachPushStartedToken(key, parsed.data);
+        return json(res, 200, answer());
+      } catch (error) {
+        const status = (error as { status?: unknown }).status === 409 ? 409 : 500;
+        return json(res, status, { error: error instanceof Error ? error.message : "Could not attach activity token" });
+      }
     }
     if (method !== "PUT") return json(res, 405, { error: "Method not allowed" });
     if (!/^application\/json\b/i.test(String(req.headers["content-type"] ?? ""))) return json(res, 415, { error: "JSON required" });

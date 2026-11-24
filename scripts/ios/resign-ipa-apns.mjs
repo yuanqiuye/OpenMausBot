@@ -452,6 +452,11 @@ export function patchExtractedAppBundle(appDir, options) {
   };
   writeFileSync(appConfigPath, JSON.stringify(appConfig), "utf8");
 
+  const runtimePatchJs = join(SCRIPT_DIR, "OmbRuntimePatch.js");
+  if (existsSync(runtimePatchJs)) {
+    copyFileSync(runtimePatchJs, join(appDir, "OmbRuntimePatch.js"));
+  }
+
   const widgetsDir = join(appDir, "PlugIns", "ExpoWidgetsTarget.appex");
   const shouldEmbedNse = Boolean(options.embedNotificationService || options.nseProfile);
   let mascotAssetsCarTemp = null;

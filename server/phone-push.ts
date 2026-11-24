@@ -72,9 +72,14 @@ const DIRECT_TITLES: Record<string, ServerLineKey> = {
   secret: "server.notify.approval",
   "turn-failed": "server.notify.turnFailed",
   "routine-failed": "server.notify.routineFailed",
+  "routine-deferred": "server.notify.routineDeferred",
   incident: "server.notify.incident",
+  "delegation-settled": "server.notify.delegationSettled",
+  brief: "server.notify.done",
   mention: "server.notify.mention",
   wait: "server.notify.wait",
+  spend: "server.notify.incident",
+  notice: "server.notify.message",
 };
 
 const DIRECT_KIND_SWITCHES: Record<string, readonly PushKind[]> = {
@@ -83,11 +88,16 @@ const DIRECT_KIND_SWITCHES: Record<string, readonly PushKind[]> = {
   "sign-in": ["sign-in"],
   secret: ["sign-in", "approval"],
   done: ["done"],
+  brief: ["done"],
+  "delegation-settled": ["done"],
   mention: ["done"],
   wait: ["done"],
   "turn-failed": ["done", "approval", "question", "sign-in"],
   "routine-failed": ["done", "approval", "question", "sign-in"],
+  "routine-deferred": ["done", "approval", "question", "sign-in"],
   incident: ["done", "approval", "question", "sign-in"],
+  spend: ["done", "approval", "question", "sign-in"],
+  notice: ["done"],
 };
 
 const PUSH_PREVIEW_MAX = 180;

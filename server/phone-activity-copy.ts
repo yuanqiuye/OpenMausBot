@@ -165,3 +165,34 @@ export function buildNeedsYouAnswers(
     { label: actionLabel, link: `${scheme}://chat/${encoded}?focus=${ask}`, refusal: false },
   ];
 }
+
+export interface ActivityStepInput {
+  activity: string;
+  target?: string;
+  file?: string;
+  tool?: string;
+}
+
+export function extractActivityStep(event: Record<string, unknown>): ActivityStepInput | null {
+  if (event.type === "turn.progress" && typeof event.activity === "string") {
+    return {
+      activity: event.activity,
+      ...(typeof event.target === "string" && event.target ? { target: event.target } : {}),
+      ...(typeof event.file === "string" && event.file ? { file: event.file } : {}),
+      ...(typeof event.tool === "string" && event.tool ? { tool: event.tool } : {}),
+    };
+  }
+  if (event.type === "item.started" && event.itemType === "tool") {
+    const step = event.step && typeof event.step === "object" ? event.step as Record<string, unknown> : null;
+    if (step && typeof step.activity === "string") {
+      return {
+        activity: step.activity,
+        ...(typeof step.target === "string" && step.target ? { target: step.target } : {}),
+      };
+    }
+    if (typeof event.title === "string" && event.title.trim()) {
+      return { activity: "tool", target: event.title.trim() };
+    }
+  }
+  return null;
+}

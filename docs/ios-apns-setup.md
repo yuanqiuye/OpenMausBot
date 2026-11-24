@@ -2,8 +2,8 @@
 
 OpenMausBot 支援透過你自己的 **Apple Developer `.p8` 推播金鑰（APNs AuthKey）**，直接從本地電腦向已配對的 iPhone / iPad 發送：
 
-1. **關掉 App 後的三層豐富背景通知（Communication Notification + 機器人頭像）**：支援 `approval`（需要核准）、`question`（機器人提問）、`sign-in` / `secret`（需要登入或提供憑證）、`done`（回覆完成）、`turn-failed` / `routine-failed` / `incident`（異常與失敗提醒）與 `mention`（群組點名），以 iOS Communication Notification 顯示 **機器人專屬頭像/吉祥物圖示 + 機器人名稱 + 對話主題副標題 + 回覆/請求摘要預覽**（亦可在設定中關閉預覽切換為純無內容隱私模式）。
-2. **鎖屏即時動態與靈動島全生命週期（ActivityKit Live Activity Push）**：在背景執行超過 1.5 秒時自動遠端喚起靈動島（`push-to-start`）、每 6 秒節流推送目前工具步驟、卡在核准/提問時顯示具體原因與雙膠囊操作按鈕、完成時顯示 `✓` 勾勾與完成摘要停留 45 秒後自動收合。
+1. **關掉 App 後的三層豐富背景通知（Communication Notification + 機器人頭像）**：支援 `approval`（需要核准）、`question`（機器人提問）、`sign-in` / `secret`（需要登入或提供憑證）、`done` / `brief` / `delegation-settled`（回覆與定時簡報完成）、`turn-failed` / `routine-failed` / `routine-deferred` / `incident` / `spend` / `notice`（異常、排程與額度提醒）與 `mention`（群組點名），以 iOS Communication Notification 顯示 **機器人專屬頭像/吉祥物圖示 + 機器人名稱 + 對話主題副標題 + 回覆/請求摘要預覽**（亦可在設定中關閉預覽切換為純無內容隱私模式）。
+2. **鎖屏即時動態與靈動島全生命週期（ActivityKit Live Activity Push）**：在背景執行超過 1.5 秒時自動遠端喚起靈動島（`push-to-start`）、自動回報實例專屬更新 Token 並保護背景靈動島不被誤關、每 6 秒節流推送目前工具步驟、卡在核准/提問時顯示具體原因與雙膠囊操作按鈕、完成時顯示 `✓` 勾勾與完成摘要停留 30 秒後自動收合。
 
 全程由你的電腦直連 Apple APNs，不經過任何第三方中繼伺服器。
 
