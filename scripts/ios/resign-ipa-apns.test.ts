@@ -273,7 +273,9 @@ describe.runIf(process.platform === "darwin")("resign-ipa-apns bundle patcher", 
     const otoolOut = execFileSync("/usr/bin/otool", ["-L", bin], { encoding: "utf8" });
     expect(otoolOut).toContain("@executable_path/Frameworks/OmbNotificationAvatar.dylib");
   });
+});
 
+describe("OmbRuntimePatch.js", () => {
   it("guards background LiveActivity.end() calls and relays push-started tokens in OmbRuntimePatch.js", async () => {
     const patchSource = readFileSync(new URL("./OmbRuntimePatch.js", import.meta.url), "utf8");
     let currentAppState = "background";

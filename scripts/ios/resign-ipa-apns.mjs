@@ -1,4 +1,3 @@
-#!/usr/bin/env node
 // Patches a FairPlay-decrypted MausBot IPA to enable remote APNs alerts + ActivityKit Live Activity push tokens,
 // aligns Bundle ID / App Group / Keychain Access Groups, and optionally re-signs with Apple provisioning profiles.
 import { execFileSync } from "node:child_process";
