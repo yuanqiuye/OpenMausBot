@@ -1,7 +1,9 @@
 // A real server in a temporary home with the fake engines and a stand-in control plane: two paired phones register for
 // closed-app alerts; a finished reply and a question reach, as content-free pushes carrying the stream's own
 // identifier, only the phone that holds no live event stream; signing a phone out unregisters its token; a phone whose
-// stream closes gets the next one. A second server with phone push left off keeps nothing and calls nobody.
+// stream closes gets the next one. Phone push is on by default, yet with no phone paired that server calls the control
+// plane not once, at start or after an alert. Two more servers, switched off in config.json and by OMB_PHONE_PUSH=0, keep
+// nothing and call nobody.
 import { spawn, type ChildProcess } from "node:child_process";
 import { generateKeyPairSync, verify } from "node:crypto";
 import { chmodSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
@@ -28,20 +30,22 @@ const FCM_B = `fcmPhoneB_01:APA91b${"Q".repeat(140)}`;
 interface Fixture { child: ChildProcess; home: string; base: string; stderr: () => string }
 
 let stub: ControlPlaneStub;
+let offStub: ControlPlaneStub;
 let apnsH2: Http2Server;
 let apnsOrigin = "";
 const apnsReceived: Array<{ headers: Record<string, string>; body: any }> = [];
 let on: Fixture;
 let off: Fixture;
+let envOff: Fixture;
 let direct: Fixture;
 const streams: SseRecorder[] = [];
 
-async function boot(env: Record<string, string>): Promise<Fixture> {
+async function boot(env: Record<string, string>, features: Record<string, boolean> = {}): Promise<Fixture> {
   const home = mkdtempSync(join(tmpdir(), "omb-phone-push-"));
   const data = join(home, ".openmausbot");
   mkdirSync(data, { recursive: true });
   writeFileSync(join(data, "config.json"), JSON.stringify({
-    features: { smartSetupChoices: false },
+    features: { smartSetupChoices: false, ...features },
     instances: {
       quick: { driver: "claudeAgent", displayName: "Quick fixture", environment: { FAKE_CLAUDE_MODE: "happy", FAKE_CLAUDE_REPLIES: JSON.stringify(Array.from({ length: 8 }, () => SECRET_REPLY)) }, config: { cli: FAKE_CLAUDE } },
       slow: { driver: "claudeAgent", displayName: "Slow fixture", environment: { FAKE_CLAUDE_MODE: "slow", FAKE_CLAUDE_SLOW_FINISH_GATE: join(home, "finish-gate") }, config: { cli: FAKE_CLAUDE } },
@@ -104,7 +108,7 @@ const sends = () => stub.pushes.filter((push) => push.path.endsWith("/send"));
 beforeAll(async () => {
   chmodSync(FAKE_CLAUDE, 0o755);
   chmodSync(FAKE_ACP, 0o755);
-  stub = await startControlPlaneStub();
+  [stub, offStub] = await Promise.all([startControlPlaneStub(), startControlPlaneStub()]);
   apnsH2 = http2.createServer();
   apnsH2.on("stream", (stream: ServerHttp2Stream, headers) => {
     const chunks: Buffer[] = [];
@@ -121,34 +125,55 @@ beforeAll(async () => {
   apnsOrigin = `http://127.0.0.1:${(apnsH2.address() as AddressInfo).port}`;
 
   const credential = stub.seedInstallation("phone push fixture");
-  [on, off, direct] = await Promise.all([
-    boot({ OMB_PHONE_PUSH: "1", OMB_CONTROL_PLANE_URL: stub.url, OMB_PUSH_CREDENTIAL: credential }),
+  const offCredential = offStub.seedInstallation("phone push off fixture");
+  // `on` has no switch at all: phone push is on by default.
+  [on, off, envOff, direct] = await Promise.all([
     boot({ OMB_CONTROL_PLANE_URL: stub.url, OMB_PUSH_CREDENTIAL: credential }),
+    boot({ OMB_CONTROL_PLANE_URL: offStub.url, OMB_PUSH_CREDENTIAL: offCredential }, { phonePush: false }),
+    boot({ OMB_PHONE_PUSH: "0", OMB_CONTROL_PLANE_URL: offStub.url, OMB_PUSH_CREDENTIAL: offCredential }),
     boot({ OMB_APNS_LOOPBACK_URL: apnsOrigin, OMB_PHONE_ACTIVITY_LINGER_MS: "250" }),
   ]);
 }, 60_000);
 
 afterAll(async () => {
   for (const stream of streams) stream.close();
-  for (const fixture of [on, off, direct]) {
+  for (const fixture of [on, off, envOff, direct]) {
     if (!fixture) continue;
     await waitForExit(fixture.child, { signal: "SIGTERM" });
     await removeTempDir(fixture.home);
   }
   await new Promise<void>((resolve) => apnsH2 ? apnsH2.close(() => resolve()) : resolve());
   await stub?.close();
+  await offStub?.close();
 });
 
-describe("phone push left off", () => {
-  it("answers off, keeps nothing and calls no relay", async () => {
-    const phone = await pair(off, "Off phone");
-    expect(await api(off, "PUT", "/api/push/device", { platform: "apns", token: APNS_A }, phone.token)).toEqual({ status: 200, body: { push: "off", relay: "off", device: null } });
-    expect(await api(off, "GET", "/api/push/device", undefined, phone.token)).toEqual({ status: 200, body: { push: "off", device: null } });
-    expect(stub.pushes).toEqual([]);
+describe("phone push on by default, with no phone paired", () => {
+  it("calls the control plane not once, at start or after a finished reply", async () => {
+    expect(stub.calls).toEqual([]);
+    const watcher = await openSse(`${on.base}/api/events`, { origin: on.base });
+    streams.push(watcher);
+    await watcher.until((frame) => frame.kind === "hello", 10_000);
+    const echo = await createBot(on, "Echo", "quick", "claude-sonnet-5");
+    expect((await api(on, "POST", `/api/bots/${echo.id}/messages`, { text: "anyone there?" })).status).toBe(202);
+    await watcher.until((frame) => frame.kind === "notify" && frame.notification?.kind === "done" && frame.notification?.botId === echo.id, 30_000);
+    await new Promise((resolve) => setTimeout(resolve, 1_500));
+    expect(stub.calls).toEqual([]);
+    watcher.close();
+  }, 60_000);
+});
+
+describe("phone push switched off", () => {
+  it("in config.json or by OMB_PHONE_PUSH=0: answers off, keeps nothing and calls no relay", async () => {
+    for (const fixture of [off, envOff]) {
+      const phone = await pair(fixture, "Off phone");
+      expect(await api(fixture, "PUT", "/api/push/device", { platform: "apns", token: APNS_A }, phone.token)).toEqual({ status: 200, body: { push: "off", relay: "off", device: null } });
+      expect(await api(fixture, "GET", "/api/push/device", undefined, phone.token)).toEqual({ status: 200, body: { push: "off", device: null } });
+    }
+    expect(offStub.calls).toEqual([]);
   });
 });
 
-describe("phone push switched on", () => {
+describe("phone push on by default, with phones paired", () => {
   it("wakes only the phone that is not connected, without the reply's text, and stops when it signs out", async () => {
     const phoneA = await pair(on, "Phone A");
     const phoneB = await pair(on, "Phone B");

@@ -7,7 +7,7 @@ import type { ConnectorToolGrant } from "../shared/wire.ts";
 import { loginLabel, type LoginPlace } from "../shared/logins.ts";
 import { vaultNameKey } from "../shared/vault.ts";
 import { isConversational, type ReplyStyle } from "../shared/reply-style.ts";
-import { REPLY_HABITS_PROMPT } from "./reply-habits.ts";
+import { replyHabitsPrompt } from "./reply-habits.ts";
 
 export type PromptPart = { id: string; label: string; text: string };
 export type PromptSection = PromptPart & { bytes: number };
@@ -47,7 +47,7 @@ export function heavyPrompt(sections: readonly PromptSection[]): boolean {
 // runs of a bot and not others) and an automation run's reply rule ("automation-reply"), which otherwise makes every
 // routine run write a new cached prefix.
 const VOLATILE_SECTIONS = new Set(["memory", "mentions", "outstanding", "teammate-questions", "long-waits", "recent", "availability", "active-routines",
-  "plan", "assignment", "routine-execution", "automation-reply", "skill-instructions", "playbooks", "device-place", "files", "tool-bridge"]);
+  "plan", "assignment", "routine-execution", "automation-reply", "skill-instructions", "playbooks", "device", "device-place", "files", "tool-bridge"]);
 /** In the stable half, so it is not sent again whenever availability changes, but no part of what a per-thread process is
  * keyed on: a warm process gets a changed roster as a note instead of a relaunch (SendTurnInput.systemRoster). */
 const ROSTER_SECTION = "roster";
@@ -80,8 +80,11 @@ export function replyStylePrompt(style: ReplyStyle | undefined): string {
 
 const MAUSBOT_PERSONA = "You are also this person's MausBot, their helper for everything in OpenMausBot. You know the app: answer \"how do I…\" questions with the plain steps in the app. Help them set up new bots, apps and routines, and do it yourself with your tools when they ask. Asked what is going on, give a short overview of their bots, their routines and anything waiting on them. Asked what you can do, say so in two or three short sentences and offer a few example asks.";
 
+// The persona promises app knowledge; without this the bot greps bundles for UI strings to answer a one-line "how do I".
+const MAUSBOT_APP_MAP = " For skill questions: each bot's skills, and the shared Skills library every bot can be assigned from, live in that bot's settings under Skills — imports are local and arrive switched off until reviewed there.";
+
 export function botPersona(bot: { name: string; title?: string; description?: string; defaultBot?: object }): string {
-  return [`You are ${bot.name}, a personal bot in OpenMausBot.`, bot.title && `Role: ${bot.title}.`, bot.description && `About: ${bot.description}`, bot.defaultBot && MAUSBOT_PERSONA]
+  return [`You are ${bot.name}, a personal bot in OpenMausBot.`, bot.title && `Role: ${bot.title}.`, bot.description && `About: ${bot.description}`, bot.defaultBot && MAUSBOT_PERSONA + MAUSBOT_APP_MAP]
     .filter(Boolean)
     .join(" ");
 }
@@ -91,7 +94,8 @@ export function buildSystemPrompt(
   soul: string,
   parts: PromptPart[],
   agents?: { env?: Record<string, string | undefined> },
-  opts?: { replyStyle?: ReplyStyle; rules?: string },
+  /** `pagesOff`: the person turned off this bot's Pages and apps tools, so it has no publish_page. */
+  opts?: { replyStyle?: ReplyStyle; rules?: string; pagesOff?: boolean },
 ): { text: string; sections: PromptSection[]; stable: string; volatile: string; roster: string } {
   const ordered: PromptPart[] = [
     { id: "persona", label: "Identity", text: persona },
@@ -101,7 +105,8 @@ export function buildSystemPrompt(
     { id: "tool-bridge", label: "Tool search", text: agentsToolBridged(agents) ? AGENTS_TOOL_BRIDGE_PROMPT : "" },
     { id: "reply-style", label: "Reply style", text: replyStylePrompt(opts?.replyStyle) },
     ...parts,
-    { id: "reply-habits", label: "How to reply", text: REPLY_HABITS_PROMPT },
+    // Only a turn with the agents tools, Pages and apps on, has publish_page.
+    { id: "reply-habits", label: "How to reply", text: replyHabitsPrompt(Boolean(agents) && opts?.pagesOff !== true) },
   ];
   const sections = ordered
     .filter((part) => part.text.length > 0)
@@ -194,7 +199,14 @@ export { syncedFolders } from "./cloud-sync-store.ts";
 export const CLOUD_ENGINES_HERE = " The AIs bots run on (Claude, Codex, Cursor and the rest) run here, on My Cloud, not on their computer or their cloud computer."
   + " If one needs installing or signing in, tell them to choose it in the model picker: its card does that here, with a sign-in link they open on any device."
   + " Never tell them to run an AI's install or sign-in command on their own computer, and never run one on their cloud computer yourself: neither signs in the AIs here."
-  + " When an AI's Google sign-in ends on a 127.0.0.1 or localhost page that can't be reached, that is the expected last step, not a failed sign-in: tell them to copy that page's full address and paste it in the \"Paste its address here\" field on the AI's card, then press Send redirect.";
+  + " When an AI's Google sign-in ends on a 127.0.0.1 or localhost page that can't be reached, that is the expected last step, not a failed sign-in: tell them to copy that page's full address and paste it in the \"Paste its address here\" field on the AI's card, then press Send redirect."
+  + " When Google's Antigravity page shows a code after the sign-in, that is the last step too: tell them to paste the code in the \"Code from the Antigravity page\" field on the AI's card, then press Send code.";
+
+/** My Cloud's disk is its owner's: what a task already has in its folder is used again, not fetched a second time. */
+export const CLOUD_REUSE_INSTALLS = " Reuse, and update if needed, what is already installed or cloned in your working folder instead of installing or cloning it again, unless the person asks for a fresh copy.";
+
+/** Work on a Cloud disk lives only there: code with a remote goes up as a branch, never over anyone's main line. */
+export const CLOUD_PUSH_CODE_WORK = " When a project in your working folder has a git remote the person works in and you can push to it, commit your work and push it to one branch of your own, reusing that branch, instead of leaving it only on this disk: never force-push, never push to the default branch, and never commit secrets, .env files or installed packages such as node_modules.";
 
 /** `asks`: the person's own Cloud, whose bots ask them to turn on what their computer doesn't give now (ask_for_computer). */
 export function cloudHomePrompt(sharedComputerTools: boolean, synced: ReadonlyArray<{ computerName: string; pcPath: string; cloudPath: string }> = [],
@@ -211,6 +223,8 @@ export function cloudHomePrompt(sharedComputerTools: boolean, synced: ReadonlyAr
     + (asks ? " For work that doesn't need their own computer, use what works here:" : " Offer what works here:")
     + " the built-in browser and their cloud computer, a desktop in the cloud. Call it their cloud computer, as the app does. Never ask them to set up this computer or a Local VM; neither exists here."
     + CLOUD_ENGINES_HERE
+    + CLOUD_REUSE_INSTALLS
+    + CLOUD_PUSH_CODE_WORK
     + syncedFoldersPrompt(synced);
 }
 
@@ -294,8 +308,14 @@ export function longCommandsPrompt(computer: ComputerPromptKind | null): string 
 }
 export const THREADS_PROMPT =
   " A thread is one conversation with its own history and run, a row under its bot; several can run at once. start_thread opens one on yourself for separate work; coordinate_bots with thread \"new\" gives a teammate a job in a fresh one; list_threads shows how yours are going. Write a thread's title as #Title so it links. Never use a ticket comment, note or room post as a stand-in for a thread. When the person says to burst something, or a request is clearly many independent items in parallel, use burst: it shows a card, nothing runs until they press Run, and results come back here as one merged reply.";
+export const ROOM_CLOSE_PROMPT =
+  "When the work in this thread is finished, close it with your final reply (close_thread with no thread_id). Leave it open only when you are waiting on a named person or thing, and say what.";
+/** Team Clouds only, where every bot has the board tools: splitting, and showing where the work stands, are the person's
+ * ask, never the bot's own idea. The view uses the statuses people see on the room's threads (src/lib/room-work.ts). */
+export const ROOM_SPLIT_PROMPT =
+  "When a person here asks you to split up or share out work, or hands you a goal with clearly separate parts, put the parts on board_add: each gets its own thread and a free bot of the room takes it. Otherwise just answer. Never split a small request or a piece you were handed. When someone asks to see the work or where it stands, call board_list and show it here with show_html as one compact page grouped as Up next, <Bot> working, Needs <name>, Done and Stopped; asked again, replace that page by its app_id. Never show it unasked.";
 export const WIDGET_PROMPT =
-  " Unless the person asked (here or in your instructions) to check with them first, ask only what you cannot find or sensibly default, one thing at a time. For a pick among a few options (a time, a day, a choice), use show_widget: a Card with a Row of Buttons, one per option, whose onClickAction sends that option in one tap, at most six; the caption may say they can also type. To change something that exists (routine, reminder, booking, setting), show a form prefilled with its current values (each field's defaultValue), captioned as the current setting, with a confirm button that saves the change. Use a multi-field form only for that or when several required details truly cannot be defaulted. A plain yes or no needs no widget: ask in one short sentence; a word or 👍/👎 on your message comes back as their reply. Data and comparisons go in a markdown table, not a widget.";
+  " Unless the person asked (here or in your instructions) to check with them first, ask only what you cannot find or sensibly default, one thing at a time. For a pick among a few options (a time, a day, a choice), use show_widget: a Card with a Row of Buttons, one per option, whose onClickAction sends that option in one tap, at most six; the caption may say they can also type. To change something that exists (routine, reminder, booking, setting), show a form prefilled with its current values (each field's defaultValue), captioned as the current setting, with a confirm button that saves the change. Use a multi-field form only for that or when several required details truly cannot be defaulted. A plain yes or no needs no widget: ask in one short sentence; a word or 👍 on your message comes back as their reply, and a 👎 reaches you as a note with their next message. Data and comparisons go in a markdown table, not a widget.";
 const APPLIED_RESULT_PROMPT =
   " Follow the tool result: a change you ask for (your skills, profile or model, or as a Chief a teammate's) applies immediately at every access level and the person sees it with an Undo; then continue the requested work without asking for another confirmation. Only a pending result (a Cloud conversation its owner did not drive) waits for the owner: then end the turn. Never claim success before an applied result, and report failures honestly. Full Access does not grant another bot broader permissions.";
 const AUTOMATION_COMPLETION_PROMPT =

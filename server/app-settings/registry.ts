@@ -34,6 +34,13 @@ interface Base {
   /** What a person or bot sees. Never a secret: a key reads as set or not set. */
   read(): string;
 }
+export interface BatchWriteResult {
+  refusal?: string;
+  change: string;
+  before: unknown;
+  skipped?: Array<{ botId: string; name: string; reason: string }>;
+}
+
 /** `value` checks what the bot sends at the boundary. `current`, read just before the write, is what Undo writes back to
  * put things as they were (typed as `write` takes it); undefined when the earlier state can't be set back. `describe` is
  * for a change that does not read as before → after: the one line its applied card shows, or why a bot may not make it. */
@@ -46,7 +53,10 @@ interface Writable {
   fromFile?: true;
   current(value: unknown): unknown;
   write(value: unknown): Promise<string | null>;
+  writeBatch?(value: unknown): Promise<BatchWriteResult>;
   describe?(value: unknown): { change: string } | { refusal: string };
+  /** Optional snapshot key of targeted live fields for Undo staleness checks when `read()` returns constant text. */
+  undoTag?(before: unknown): string;
 }
 interface Secret {
   tier: "secret";
@@ -94,8 +104,8 @@ const KEY_WHERE: Partial<Record<CredentialTargetId, Where>> = {
   onePasswordToken: "vault",
 };
 
-export type WritableSpec = Omit<Base, "read"> & Omit<Writable, "tier" | "current" | "write" | "describe"> & {
-  read?(): string; current(value: never): unknown; write(value: never): Promise<string | null>; describe?(value: never): { change: string } | { refusal: string };
+export type WritableSpec = Omit<Base, "read"> & Omit<Writable, "tier" | "current" | "write" | "describe" | "writeBatch" | "undoTag"> & {
+  read?(): string; current(value: never): unknown; write(value: never): Promise<string | null>; writeBatch?(value: never): Promise<BatchWriteResult>; describe?(value: never): { change: string } | { refusal: string }; undoTag?(before: unknown): string;
 };
 /** `line` says what the new value does on the applied card; `refusal` names a value only the person sets, in Settings. */
 export type WindowPref = (id: WindowPrefId, label: string, help: string, where: Where, synonyms: string[], allowed: string,
@@ -141,7 +151,7 @@ export function createSettingsRegistry(deps: RegistryDeps): SettingEntry[] {
   const names = (ids: readonly string[]) => ids.map((id) => deps.bots().find((bot) => bot.id === id)?.name ?? id).join(", ");
   const writable = (spec: WritableSpec): SettingEntry => ({
     ...spec, tier: "safe", read: spec.read ?? (() => display((spec.current as () => unknown)())), current: spec.current as Writable["current"],
-    write: spec.write as Writable["write"], ...(spec.describe ? { describe: spec.describe as Writable["describe"] } : {}),
+    write: spec.write as Writable["write"], ...(spec.writeBatch ? { writeBatch: spec.writeBatch as Writable["writeBatch"] } : {}), ...(spec.describe ? { describe: spec.describe as Writable["describe"] } : {}), ...(spec.undoTag ? { undoTag: spec.undoTag } : {}),
   });
   const config = <V,>(patch: (value: V) => Record<string, unknown>) => (value: V) => deps.saveConfig(patch(value));
   const windowPref: WindowPref = (id, label, help, where, synonyms, allowed, line) => writable({
@@ -155,7 +165,7 @@ export function createSettingsRegistry(deps: RegistryDeps): SettingEntry[] {
 
   const safe: SettingEntry[] = [
     windowPref("appearance.skin", "Skin", "The window's built-in look; \"system\" follows the computer's light or dark mode. A custom look (any colours, fonts, CSS, pictures) is a theme: use action theme.", "theme", ["theme", "dark mode", "light mode", "colors", "look"], enumOf(WINDOW_PREFS["appearance.skin"].options)),
-    windowPref("appearance.advanced", "Advanced mode", "Advanced shows every setting and tool; Simple keeps the everyday ones.", "advanced-mode", ["simple mode", "advanced mode", "interface mode"], "true or false"),
+    windowPref("appearance.advanced", "Advanced mode", "Advanced shows every setting and tool; Simple keeps the everyday ones. Change it only when the person asks for Simple or Advanced mode by name, never to reach another setting: those change in either mode.", "advanced-mode", ["simple mode", "advanced mode", "interface mode"], "true or false"),
     windowPref("appearance.font", "Font", "The app's typeface.", "tool-calls", ["typeface", "typography"], enumOf(WINDOW_PREFS["appearance.font"].options)),
     windowPref("appearance.chatWidth", "Chat width", "How wide the chat column is.", "tool-calls", ["layout", "column", "wide"], enumOf(WINDOW_PREFS["appearance.chatWidth"].options)),
     windowPref("general.sendKey", "Send key", "Which key sends a message in the composer.", "send-key", ["enter", "typing", "keyboard", "shortcut"], enumOf(WINDOW_PREFS["general.sendKey"].options)),
@@ -234,22 +244,27 @@ export function createSettingsRegistry(deps: RegistryDeps): SettingEntry[] {
     }),
   ];
 
-  const provider = (id: string, label: string, synonyms: string[], current: () => string | undefined, patch: (text: string) => Record<string, unknown>): SettingEntry => writable({
+  const provider = (id: string, label: string, synonyms: string[], current: () => string | undefined, patch: (text: string) => Record<string, unknown>, keySaved?: () => boolean): SettingEntry => writable({
     id, label, help: `${label}: the address MausBot sends requests to. Empty uses the provider's own.`, where: "keys", synonyms: [...synonyms, "url", "base url", "endpoint", "address", "proxy"],
-    value: url, allowed: "an http(s) address, or empty to clear", current: () => current() ?? "", write: config(patch),
+    value: url, allowed: "an http(s) address, or empty to clear", current: () => current() ?? "",
+    write: async (text: string) => {
+      // Security: this address decides where the saved key is sent, so once one is saved only the person moves it.
+      if (text !== "" && text !== (current() ?? "") && keySaved?.() === true) return personOnly(`${label} (it decides where the saved key is sent)`, "keys");
+      return config(patch)(text);
+    },
   });
   const providers: SettingEntry[] = [
-    provider("providers.anthropic.url", "Anthropic address", ["anthropic", "claude"], () => cfg().anthropic?.url, (text) => ({ anthropic: { ...cfg().anthropic, url: text } })),
-    provider("providers.xai.url", "xAI address", ["xai", "grok"], () => cfg().xai?.url, (text) => ({ xai: { ...cfg().xai, url: text } })),
-    provider("providers.groq.url", "Groq address", ["groq"], () => cfg().groq?.url, (text) => ({ groq: { ...cfg().groq, url: text } })),
-    provider("providers.meta.url", "Meta address", ["meta", "llama"], () => cfg().meta?.url, (text) => ({ meta: { ...cfg().meta, url: text } })),
-    provider("providers.openaiCompat.url", "OpenAI-compatible address", ["openai compatible", "custom provider", "ollama", "lm studio", "openrouter"], () => cfg().openaiCompat?.url, (text) => ({ openaiCompat: { ...cfg().openaiCompat, url: text } })),
+    provider("providers.anthropic.url", "Anthropic address", ["anthropic", "claude"], () => cfg().anthropic?.url, (text) => ({ anthropic: { ...cfg().anthropic, url: text } }), () => Boolean(cfg().anthropic?.key)),
+    provider("providers.xai.url", "xAI address", ["xai", "grok"], () => cfg().xai?.url, (text) => ({ xai: { ...cfg().xai, url: text } }), () => Boolean(cfg().xai?.key)),
+    provider("providers.groq.url", "Groq address", ["groq"], () => cfg().groq?.url, (text) => ({ groq: { ...cfg().groq, url: text } }), () => Boolean(cfg().groq?.key)),
+    provider("providers.meta.url", "Meta address", ["meta", "llama"], () => cfg().meta?.url, (text) => ({ meta: { ...cfg().meta, url: text } }), () => Boolean(cfg().meta?.key)),
+    provider("providers.openaiCompat.url", "OpenAI-compatible address", ["openai compatible", "custom provider", "ollama", "lm studio", "openrouter"], () => cfg().openaiCompat?.url, (text) => ({ openaiCompat: { ...cfg().openaiCompat, url: text } }), () => Boolean(cfg().openaiCompat?.key)),
     writable({
       id: "providers.openaiCompat.model", label: "OpenAI-compatible model", help: "The model name sent to the OpenAI-compatible provider.", where: "keys",
       synonyms: ["openai compatible", "custom provider", "model name"], value: z.string().trim().max(200), allowed: "a model name, or empty to clear",
       current: () => cfg().openaiCompat?.model ?? "", write: config((model: string) => ({ openaiCompat: { ...cfg().openaiCompat, model } })),
     }),
-    provider("voice.baseUrl", "Voice server address", ["tts", "voice", "speech", "chatterbox"], () => cfg().tts?.baseUrl, (text) => ({ tts: { ...cfg().tts, baseUrl: text } })),
+    provider("voice.baseUrl", "Voice server address", ["tts", "voice", "speech", "chatterbox"], () => cfg().tts?.baseUrl, (text) => ({ tts: { baseUrl: text } })),
   ];
 
   const secret: SettingEntry[] = (Object.keys(CREDENTIAL_TARGETS) as CredentialTargetId[]).map((credentialId) => {
@@ -329,11 +344,11 @@ export function createSettingsRegistry(deps: RegistryDeps): SettingEntry[] {
       "members", ["people", "members", "invite", "roles", "admins", "sign in access"], () => "managed in Settings"),
     ownerOnly("remote.domain", "Custom domain", "The web address this self-hosted server answers on. Changing it can cut off the address the person is using right now.", "domain",
       ["domain", "custom domain", "dns", "public url"], () => cfg().customDomain ?? ""),
-    ownerOnly("remote.httpsAddress", "HTTPS address", "This computer's public HTTPS address for paired devices; turning it off can cut off the device the person is using now.", "tailscale",
+    ownerOnly("remote.httpsAddress", "HTTPS address", "This computer's public HTTPS address for paired devices; turning it off can cut off the device the person is using now.", "https-address",
       ["https", "public address"], () => "managed in Settings"),
   ];
 
-  return [...safe, ...providers, engines, ...botEntries(deps, writable), ...pictureEntries(deps, writable), ...configEntries(deps, writable), ...windowEntries(windowPref), ...secret, ...owner];
+  return [...safe, ...providers, engines, ...botEntries(deps, writable), ...pictureEntries(deps, writable), ...configEntries(deps, writable), ...windowEntries(windowPref, (id) => deps.window.read(id)), ...secret, ...owner];
 }
 
 export function findSettings(entries: readonly SettingEntry[], query: string, limit = 8): SettingEntry[] {

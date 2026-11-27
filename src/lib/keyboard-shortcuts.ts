@@ -1,4 +1,5 @@
 import type { SendKey } from "./send-key";
+import { START_FRESH_KEYS } from "./start-fresh";
 import { t } from "@/lib/i18n";
 import { en, type LocaleKey } from "@/locales";
 
@@ -55,6 +56,12 @@ export const SHORTCUT_GROUPS: readonly ShortcutGroup[] = [
         winKeys: ["Ctrl", "Shift", "[ / ]"],
       },
       {
+        id: "switch-thread",
+        description: "Switch to the bot's next / previous thread",
+        macKeys: ["⌃", "Tab / ⇧Tab"],
+        winKeys: ["Ctrl", "Tab / Shift+Tab"],
+      },
+      {
         id: "find-conversation",
         description: "Find in conversation",
         macKeys: ["⌘", "F"],
@@ -88,6 +95,12 @@ export const SHORTCUT_GROUPS: readonly ShortcutGroup[] = [
         description: "Edit last message (when composer is empty)",
         macKeys: ["↑"],
         winKeys: ["↑"],
+      },
+      {
+        id: "start-fresh",
+        description: "Start fresh in this conversation (keeps the messages)",
+        macKeys: [...START_FRESH_KEYS.mac],
+        winKeys: [...START_FRESH_KEYS.win],
       },
       {
         id: "dictation-toggle",
@@ -196,6 +209,14 @@ export function botCycleStep(event: Pick<KeyboardEvent, "key">): 1 | -1 | null {
   if (event.key === "]" || event.key === "}") return 1;
   if (event.key === "[" || event.key === "{") return -1;
   return null;
+}
+
+/** Ctrl on macOS too: ⌘Tab belongs to the system. keyCode 229 is a composing key in browsers that leave isComposing unset. */
+export function threadCycleStep(event: Pick<KeyboardEvent, "key" | "ctrlKey" | "metaKey" | "altKey" | "shiftKey" | "defaultPrevented" | "isComposing" | "keyCode" | "target">): 1 | -1 | null {
+  if (event.key !== "Tab" || !event.ctrlKey || event.metaKey || event.altKey || event.defaultPrevented || event.isComposing || event.keyCode === 229) return null;
+  const target = event.target;
+  if (typeof Element !== "undefined" && target instanceof Element && target.closest("dialog, [role=dialog], [role=alertdialog]")) return null;
+  return event.shiftKey ? -1 : 1;
 }
 
 /**

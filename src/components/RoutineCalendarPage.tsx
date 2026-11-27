@@ -1,4 +1,4 @@
-import { boatCapableEngine } from "@/lib/remote-desktop";
+import { boatCapableEngine } from "@/lib/remote-desktop"; import { isPlaceId } from "@/lib/place-chat";
 import { useLayoutEffect, useRef, useState, type ReactNode } from "react";
 import {
   CheckCircle2,
@@ -33,6 +33,7 @@ import { cronChoiceFor, cronDraftFor, cronEditorValue, isCronChoice, type CronCh
 import { partlyDone, routineRunLabel, routineRunsOn, routineRunText, routineRunTime, routineScheduleState } from "@/lib/routine-display";
 import { useAdvancedMode } from "@/lib/interface-mode";
 import { useShowThreads } from "@/lib/thread-preferences";
+import { openRoomThreadThen } from "@/lib/room-feed";
 import { intlLocale, t } from "@/lib/i18n";
 import { intakeFilesWithNotice } from "@/lib/attach-notice";
 import { useModalDialog } from "@/hooks/use-modal-dialog";
@@ -232,7 +233,7 @@ function BotPicker({
   onChange: (ids: string[]) => void;
 }) {
   const [query, setQuery] = useState("");
-  const filtered = bots.filter((bot) => `${bot.name} ${bot.title}`.toLowerCase().includes(query.toLowerCase()));
+  const filtered = bots.filter((bot) => !isPlaceId(bot.id) && `${bot.name} ${bot.title}`.toLowerCase().includes(query.toLowerCase())); // a My Cloud bot open in place has no routines here
   return (
     <div className="rounded-xl border border-hairline/50 bg-inset/60 p-2">
       {!locked && bots.length > 5 && (
@@ -756,7 +757,7 @@ export function EventEditor({
               )}
     </>
   );
-  const defaultRunLimit = durationLabel(isRoomGoal ? ROUTINE_GOAL_RUN_LIMIT_MINUTES : ROUTINE_RUN_LIMIT_MINUTES), runLimitControls = kind === "routine" && (
+  const defaultRunLimit = durationLabel(isRoomGoal ? (state.routineRunLimits?.goalMinutes ?? ROUTINE_GOAL_RUN_LIMIT_MINUTES) : (state.routineRunLimits?.runMinutes ?? ROUTINE_RUN_LIMIT_MINUTES)), runLimitControls = kind === "routine" && (
                 <details className="rounded-xl border border-hairline/40 bg-inset/40 px-3 py-2.5">
                   <summary className="cursor-pointer select-none text-[12px] font-medium text-ink-secondary hover:text-ink">
                     {timeoutMinutes == null ? t("routines.runLimit.none", { duration: defaultRunLimit }) : t("routines.runLimit.some", { duration: durationLabel(timeoutMinutes) })}
@@ -1201,8 +1202,7 @@ export function EventDetails({
   const openRunTask = () => {
     if (!executionThreadId) return;
     if (isRoomGoal && goalGroupId) {
-      dispatch({ type: "switchGroupTask", groupId: goalGroupId, threadId: executionThreadId });
-      onOpenRoom(goalGroupId);
+      openRoomThreadThen(dispatch, state, goalGroupId, executionThreadId, onOpenRoom);
     } else if (primary) {
       openBotThread(dispatch, primary, executionThreadId, showThreads);
     }
@@ -1331,7 +1331,7 @@ export function EventDetails({
         )}
         {!isCall && !isRoomGoal && <DrawerField label={t("routines.results.label")}><div className="text-[13px] text-ink">{resultsTitle}</div></DrawerField>}
         {attachments.length > 0 && <DrawerField label={t("routines.drawer.attachments")}><AttachmentChips attachments={attachments} />{call && <div className="mt-1.5 text-[11px] leading-relaxed text-ink-secondary">{t(call.botIds.length > 1 ? "routines.drawer.callSharedHelp" : "routines.drawer.callKeptHelp")}</div>}</DrawerField>}
-        {advanced && !isCall && <DrawerField label={t("routines.drawer.runLimit")}><div className="text-[13px] text-ink">{safetyLimit == null ? t("routines.drawer.noTimeLimit", { duration: durationLabel(isRoomGoal ? ROUTINE_GOAL_RUN_LIMIT_MINUTES : ROUTINE_RUN_LIMIT_MINUTES) }) : t("routines.drawer.stopsAfter", { duration: durationLabel(safetyLimit) })}</div></DrawerField>}
+        {advanced && !isCall && <DrawerField label={t("routines.drawer.runLimit")}><div className="text-[13px] text-ink">{safetyLimit == null ? t("routines.drawer.noTimeLimit", { duration: durationLabel(isRoomGoal ? (state.routineRunLimits?.goalMinutes ?? ROUTINE_GOAL_RUN_LIMIT_MINUTES) : (state.routineRunLimits?.runMinutes ?? ROUTINE_RUN_LIMIT_MINUTES)) }) : t("routines.drawer.stopsAfter", { duration: durationLabel(safetyLimit) })}</div></DrawerField>}
         {!isCall && (
           <DrawerField label={t("routines.logs")} action={routine && <button type="button" onClick={() => { dispatch({ type: "showRoutines", section: "logs", routineId: routine.id, botId: routine.botId }); onClose(); }} className="flex items-center gap-1 rounded-md px-1.5 py-0.5 text-[11px] text-accent-text hover:bg-raised"><FileText size={11} />{t("routines.drawer.allRuns")}</button>}>
             {recentRuns.length === 0

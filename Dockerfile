@@ -80,10 +80,11 @@ RUN arch=x64 && if [ "$TARGETARCH" = arm64 ]; then arch=arm64; fi \
 FROM node:24-bookworm-slim AS runtime
 # Install Chrome's Bookworm libraries directly: agent-browser --with-deps
 # invokes sudo even as root, and this image deliberately does not ship sudo.
-# git + curl: agent CLIs shell out to git; curl backs the healthcheck. tini is
+# git + openssh-client: agent CLIs shell out to git, and the VPS desktop reaches
+# servers over ssh; curl backs the healthcheck. tini is
 # the server image's init, and what its launcher falls back to as PID 1.
 RUN apt-get update \
-  && apt-get install -y --no-install-recommends ca-certificates curl git tini \
+  && apt-get install -y --no-install-recommends ca-certificates curl git openssh-client tini \
     libxcb-shm0 libx11-xcb1 libx11-6 libxcb1 libxext6 libxrandr2 \
     libxcomposite1 libxcursor1 libxdamage1 libxfixes3 libxi6 libgtk-3-0 \
     libpangocairo-1.0-0 libpango-1.0-0 libatk1.0-0 libcairo-gobject2 \
@@ -96,7 +97,7 @@ RUN apt-get update \
 # The bots' browser (docs/plans/browser-engine.md): the pinned agent-browser
 # and a Chrome for Testing with its libraries, so a server bot can browse.
 # Pin here and in server/browser-engine-release.ts together.
-ARG AGENT_BROWSER_VERSION=0.37.0
+ARG AGENT_BROWSER_VERSION=0.39.0
 # `agent-browser install` fetches Chrome for Testing's last-known-good Stable;
 # the publish job passes that version so a Chrome release rebuilds this layer.
 ARG CHROME_CACHE_TAG=""

@@ -21,6 +21,8 @@ export const USER_ERROR = {
   "serverError.model.accountUpdating": "this provider account is being updated — try again shortly",
   "serverError.chat.busyEdit": "the thread is working — stop it before editing",
   "serverError.chat.busyVersion": "the thread is working — stop it before switching versions",
+  "serverError.forkBusy": "Wait for this conversation to finish before forking it.",
+  "serverError.forkNoText": "This conversation has no text message to fork from yet.",
   "serverError.chat.busyFresh": "the thread is working — stop it before starting fresh",
   "serverError.chat.questionGone": "this question is no longer available",
   "serverError.chat.askerGone": "the bot that asked this question is no longer available",
@@ -76,6 +78,10 @@ export const USER_ERROR = {
   "serverError.voice.utteranceTooLong": "voice utterances are limited to 500 characters",
   "serverError.goal.alreadyRunning": "A goal is already running in this chat. Stop it before starting another.",
   "serverError.chat.missingConversation": "no such conversation",
+  "serverError.place.unsupported": "This works on My Cloud's own page. Open it from the bot's menu.",
+  "serverError.place.asleep": "My Cloud is asleep. Send again to wake it.",
+  "serverError.place.offline": "My Cloud can't be reached right now. Try again in a moment.",
+  "serverError.place.signIn": "This computer isn't signed in to My Cloud. Open My Cloud's page once, then try again.",
   "serverError.department.chiefResponsibility": "Only a Chief of Staff can be made responsible for additional departments",
   "serverError.department.confirmResponsibility": "Confirm which additional departments this Chief is responsible for (acknowledgePeerScope)",
   "serverError.owner.teamOnly": "Only a team's bots report to someone.",
@@ -229,6 +235,8 @@ export const USER_ERROR = {
   "serverError.voice.fishTranscribeConnection": "Couldn't reach Fish Audio to hear you — check your connection.",
   "serverError.voice.elevenLabsTranscribeConnection": "Couldn't reach ElevenLabs to hear you — check your connection.",
   "serverError.file.tooLarge": "This file is {size}, over the {limit} limit for opening files from chat. The file itself is still saved as {name}.",
+  "serverError.vps.tooManyCores": "{server} has {cores} CPU cores in all. Choose {cores} or fewer.",
+  "serverError.vps.tooMuchMemory": "{server} has about {memory} GB of memory. Choose {memory} GB or less.",
 } as const;
 
 export type UserErrorKey = keyof typeof USER_ERROR;

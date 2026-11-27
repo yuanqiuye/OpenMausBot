@@ -1,7 +1,9 @@
 // Closed-app phone alerts. A paired phone registers its APNs or FCM device token here; when an approval, a question, a
 // sign-in request or a finished reply would reach a phone that holds no live event stream, this asks the push relay in
-// the hosted control plane to wake it, with the installation credential this server already has. The push is
-// content-free: kind, a title from names alone, opaque ids. Off unless `features.phonePush` (or OMB_PHONE_PUSH=1).
+// the hosted control plane to wake it, with the installation credential this server already has; a Cloud home, which has
+// none, asks its Admin to relay instead (phone-push-admin.ts). The push is content-free: kind, a title from names alone,
+// opaque ids. On unless `features.phonePush: false` (or OMB_PHONE_PUSH=0). Nothing leaves this server until a paired phone
+// registers: with no registered phone there is no relay call, no timer and no connection.
 import { mkdirSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { z } from "zod";
@@ -30,11 +32,12 @@ import {
   type PublicPushDevice,
   type PushKind,
 } from "../shared/phone-push.ts";
-import { apnsConfigWithEnv, resolveApnsConfig, usableApnsPrivateKey, type ApnsConfig, type ApnsEnvironment, type ResolvedApnsConfig } from "./apns-config.ts";
+import { resolveApnsConfig, usableApnsPrivateKey, type ApnsConfig, type ApnsEnvironment, type ResolvedApnsConfig } from "./apns-config.ts";
 import { resolveBotNotificationVisual, type BotNotificationVisual } from "../shared/bot-notification-visual.ts";
 import { ApnsDirectClient, type DirectApnsActivityRequest } from "./apns-direct.ts";
 import { writeFileAtomic } from "./atomic.ts";
 import { redactSecretsInText } from "./redact.ts";
+import { cloudHomePushAccess, cloudHomePushRequest, type CloudHomePushAccess } from "./phone-push-admin.ts";
 import { conversationLanguage, serverLine, type ServerLineKey } from "./server-lines.ts";
 
 export const PHONE_PUSH_FILE = "push-devices.json";
@@ -50,8 +53,14 @@ export const MAX_PUSH_DEVICES = 50;
 
 /** One push per phone, kind and conversation in this window; the newest waiting one replaces an older one. */
 export const PUSH_COALESCE_MS = 10_000;
-export const PUSH_DEVICE_WINDOW_MS = 10 * 60_000;
-export const PUSH_DEVICE_WINDOW_MAX = 30;
+/** Pushes one phone gets in an hour, alerts and Live Activity changes together: the relay's own per-phone limit. */
+export const PUSH_DEVICE_WINDOW_MS = 60 * 60_000;
+export const PUSH_DEVICE_WINDOW_MAX = 60;
+/** Finished replies and Live Activity changes stop here, so a noisy bot leaves the rest of the hour for approvals,
+ * questions and sign-ins. */
+export const PUSH_DEVICE_LOW_MAX = 40;
+/** How long one phone is left alone after the relay said it is over a limit, when the relay names no wait. */
+export const PUSH_DEVICE_THROTTLE_MS = 60_000;
 /** A push still undelivered after this is dropped: the phone shows the news when it next connects. */
 export const PUSH_MAX_AGE_MS = 10 * 60_000;
 /** Waits before each retry of a push the relay could not take (network, 5xx). */
@@ -103,15 +112,12 @@ const DIRECT_KIND_SWITCHES: Record<string, readonly PushKind[]> = {
 const PUSH_PREVIEW_MAX = 180;
 const GENERIC_THREAD_TITLES = new Set(["shared chat", "new task", "new thread", "new chat"]);
 
-/** On when switched on (`OMB_PHONE_PUSH=1|0` wins over `features.phonePush`), or when local direct APNs is configured. */
-export function phonePushEnabled(
-  cfg: { features?: { phonePush?: boolean }; apns?: ApnsConfig },
-  env: NodeJS.ProcessEnv = process.env,
-): boolean {
+/** On for every desktop and server unless switched off: OMB_PHONE_PUSH=0 or 1 wins over `features.phonePush` in
+ * config.json, and `features.phonePush: false` turns it off. Both are an operator's kill switch; there is no setting for it. */
+export function phonePushEnabled(cfg: { features?: { phonePush?: boolean } }, env: NodeJS.ProcessEnv = process.env): boolean {
   if (env[PHONE_PUSH_ENV] === "1") return true;
   if (env[PHONE_PUSH_ENV] === "0") return false;
-  if (cfg.features?.phonePush !== undefined) return cfg.features.phonePush === true;
-  return resolveApnsConfig(apnsConfigWithEnv(cfg.apns, env)) !== null;
+  return cfg.features?.phonePush !== false;
 }
 
 export interface ApnsStatus {
@@ -178,12 +184,16 @@ const storedFile = z.object({
 type StoredDevice = z.infer<typeof storedDevice>;
 type StoredActivityToken = z.infer<typeof storedActivityToken>;
 
-export interface PhonePushAccess {
+export interface InstallationPushAccess {
   controlPlane: string;
   credential: string;
 }
+/** The control plane with an installation credential, or (a Cloud home) its Admin with its bootstrap secret. */
+export type PhonePushAccess = InstallationPushAccess | CloudHomePushAccess;
 
-export type PushOutcome = "sent" | "dropped" | "stale" | "live" | "gone" | "failed" | "retry" | "paused";
+export type PushOutcome = "sent" | "dropped" | "stale" | "live" | "gone" | "failed" | "retry" | "paused" | "throttled";
+/** An ask wakes the person; a finished reply or a Live Activity change can wait for the app to open. */
+export type PushPriority = "ask" | "other";
 
 export interface PhonePushOptions {
   dataDir: string;
@@ -265,10 +275,10 @@ function buildPushNotification(
   const botName = clip(notification.botName, PUSH_NAME_MAX) || "MausBot";
   const roomName = room && PUSH_ID.test(room.id) ? clip(room.name, PUSH_NAME_MAX) : "";
   const language = conversationLanguage(notification.threadId);
-  const who = roomName ? serverLine(language, "server.notify.inRoom", { bot: botName, room: roomName }) : botName;
+  // The lock screen shows the title: the bot's name only, never the room's, which the app shows once it is open.
   return {
     kind: notification.kind,
-    title: clip(serverLine(language, titleKey, { who }), PUSH_TITLE_MAX),
+    title: clip(serverLine(language, titleKey, { who: botName }), PUSH_TITLE_MAX),
     botId: notification.botId,
     botName,
     threadId: notification.threadId,
@@ -306,6 +316,10 @@ export class PhonePush {
   private readonly lastBySlot = new Map<string, number>();
   private readonly outbox = new Map<string, Job>();
   private pausedUntil = 0;
+  /** Phones the relay said were over a limit, until when. Other phones go on. */
+  private readonly phonePausedUntil = new Map<string, number>();
+  /** A Cloud home's Admin said it relays no push (its switch off, or no relay): until then this home answers `off`. */
+  private refusedUntil = 0;
   private timer: unknown = null;
   private draining: Promise<void> | null = null;
   private readonly options: PhonePushOptions;
@@ -346,7 +360,13 @@ export class PhonePush {
 
   status(): PhonePushState {
     if (!this.options.enabled()) return "off";
-    return this.options.apns?.() || this.options.access() ? "on" : "no-account";
+    if (this.options.apns?.()) return "on";
+    const access = this.options.access();
+    if (!access) return "no-account";
+    // A Cloud home cannot see its Admin's switch; while the Admin refuses, saying `on` would tell the phone untruly that
+    // alerts arrive with the app closed.
+    if (!("credential" in access) && this.now() < this.refusedUntil) return "off";
+    return "on";
   }
 
   counts(): { apnsDevices: number; activityTokens: number } {
@@ -358,6 +378,7 @@ export class PhonePush {
 
   resetPause(): void {
     this.pausedUntil = 0;
+    this.phonePausedUntil.clear();
     this.apnsClient.forgetToken();
     this.schedule();
   }
@@ -443,6 +464,39 @@ export class PhonePush {
     return this.relay(path, body);
   }
 
+  /** One push for the phone behind `key` (a Live Activity or ongoing-notification change), under the same hourly cap as
+   * its alerts at the lower priority; "capped" when there is no room for it, or the relay asked to leave that phone alone. */
+  async callFor(key: string, path: string, body: unknown): Promise<RelayAnswer | "capped" | null> {
+    if (!this.roomFor(key, "other", this.now())) return "capped";
+    const answer = await this.call(path, body, key);
+    if (answer && answer.status < 300) this.noteSent(key, this.now());
+    if (answer?.status === 429) this.throttle(key, answer.retryAfterMs);
+    return answer;
+  }
+
+  private recent(key: string, now: number): number[] {
+    const recent = (this.sent.get(key) ?? []).filter((at) => now - at < PUSH_DEVICE_WINDOW_MS);
+    if (recent.length) this.sent.set(key, recent);
+    else this.sent.delete(key);
+    return recent;
+  }
+
+  /** Whether one more push of this priority fits this phone's hour, and the relay has not asked to leave it alone. */
+  private roomFor(key: string, priority: PushPriority, now: number): boolean {
+    if ((this.phonePausedUntil.get(key) ?? 0) > now) return false;
+    return this.recent(key, now).length < (priority === "ask" ? PUSH_DEVICE_WINDOW_MAX : PUSH_DEVICE_LOW_MAX);
+  }
+
+  private noteSent(key: string, now: number): void {
+    this.sent.set(key, [...this.recent(key, now), now]);
+  }
+
+  /** The relay said this phone is over a limit: leave it alone for the wait it named, and drop what waits for it. */
+  private throttle(key: string, retryAfterMs: number | undefined): void {
+    this.phonePausedUntil.set(key, this.now() + Math.min(Math.max(retryAfterMs ?? PUSH_DEVICE_THROTTLE_MS, 1_000), 60 * 60_000));
+    for (const [slot, job] of this.outbox) if (job.key === key) this.outbox.delete(slot);
+  }
+
   answer(key: string): PhonePushAnswer {
     return { push: this.status(), device: this.publicDevice(key) };
   }
@@ -477,6 +531,7 @@ export class PhonePush {
     if (this.status() !== "on") return { ...this.answer(key), relay: "off" };
     if (next.platform === "apns" && this.options.apns?.()) return { ...this.answer(key), relay: "registered" };
     const answer = await this.relay(PHONE_PUSH_RELAY_PATHS.register, this.registerBody(next));
+    // A Cloud home's Admin that refused makes the answer `off`, so the phone says so and registers again at its next sync.
     return { ...this.answer(key), relay: answer && answer.status < 300 ? "registered" : "pending" };
   }
 
@@ -511,11 +566,12 @@ export class PhonePush {
   /**
    * A `notify` frame left this server as frame `seq`. Each registered phone that holds no live stream, wants this kind
    * and would have been shown the frame (`reaches`, the event stream's own audience rule) gets a push queued. Never
-   * throws, and does nothing at all while switched off.
+   * throws, and does nothing at all while switched off or with no account to push as (the phone's registration is kept,
+   * and a later send registers it with the relay first).
    */
   offer(frame: { notification: unknown; seq: number }, reaches: (key: string) => boolean): void {
     try {
-      if (!this.devices.length || !this.options.enabled()) return;
+      if (!this.devices.length || this.status() !== "on") return;
       const notification = pushableOf(frame.notification);
       if (!notification) return;
       const apns = this.options.apns?.() ?? null;
@@ -535,7 +591,7 @@ export class PhonePush {
         const wantsKind = directDevice
           ? (DIRECT_KIND_SWITCHES[notification.kind]?.some((allowed) => device.kinds.includes(allowed)) ?? false)
           : (isPushKind(notification.kind) && device.kinds.includes(notification.kind));
-        if (!wantsKind || this.options.live(device.key) || !reaches(device.key)) continue;
+        if (!wantsKind || (this.phonePausedUntil.get(device.key) ?? 0) > now || this.options.live(device.key) || !reaches(device.key)) continue;
         const slot = `${device.key}|${push.kind}|${push.threadId}`;
         const waiting = this.outbox.get(slot);
         if (!waiting && now - (this.lastBySlot.get(slot) ?? -Infinity) < PUSH_COALESCE_MS) continue;
@@ -617,8 +673,8 @@ export class PhonePush {
     if (now - job.queuedAt > PUSH_MAX_AGE_MS) return "stale";
     // The phone connected while this waited: its stream delivers the frame itself.
     if (this.options.live(job.key)) return "live";
-    const recent = (this.sent.get(job.key) ?? []).filter((at) => now - at < PUSH_DEVICE_WINDOW_MS);
-    if (recent.length >= PUSH_DEVICE_WINDOW_MAX) return "dropped";
+    // Near the hour's cap a finished reply gives way, so the asks still get through.
+    if (!this.roomFor(job.key, job.push.kind === "done" ? "other" : "ask", now)) return "dropped";
     const body = { v: PHONE_PUSH_WIRE_VERSION, token: device.token, ...(device.pairing ? { pairing: device.pairing } : {}), ...(job.collapseId ? { collapseId: job.collapseId } : {}), notification: job.push };
     const apns = device.platform === "apns" ? this.options.apns?.() : null;
     if (apns) {
@@ -633,7 +689,7 @@ export class PhonePush {
       };
       const outcome = await this.apnsClient.sendAlert(apns, device.environment, directBody);
       if (outcome.kind === "sent") {
-        this.sent.set(job.key, [...recent, now]);
+        this.noteSent(job.key, now);
         this.lastBySlot.set(job.slot, now);
         if (this.lastBySlot.size > 2_000) this.lastBySlot.clear();
         return "sent";
@@ -651,7 +707,10 @@ export class PhonePush {
         this.log(`[phone-push] direct APNs rejected signing credentials (${outcome.reason})`);
         return this.pause(5 * 60_000);
       }
-      if (outcome.kind === "throttled") return this.pause(outcome.retryAfterMs ?? 60_000);
+      if (outcome.kind === "throttled") {
+        this.throttle(job.key, outcome.retryAfterMs);
+        return "throttled";
+      }
       if (outcome.kind === "transient") return "retry";
       return "failed";
     }
@@ -662,7 +721,7 @@ export class PhonePush {
     }
     if (!answer) return "retry";
     if (answer.status < 300) {
-      this.sent.set(job.key, [...recent, now]);
+      this.noteSent(job.key, now);
       this.lastBySlot.set(job.slot, now);
       if (this.lastBySlot.size > 2_000) this.lastBySlot.clear();
       return "sent";
@@ -673,7 +732,11 @@ export class PhonePush {
       return "gone";
     }
     if (answer.code === PUSH_RELAY_ERRORS.unavailable || answer.status === 401 || answer.status === 404) return this.pause(RELAY_UNAVAILABLE_PAUSE_MS);
-    if (answer.status === 429) return this.pause(answer.retryAfterMs ?? 60_000);
+    // Over a limit: only this phone waits. Should the limit be the home's or the fleet's, each phone learns so once.
+    if (answer.status === 429) {
+      this.throttle(job.key, answer.retryAfterMs);
+      return "throttled";
+    }
     if (answer.status >= 500) return "retry";
     return "failed";
   }
@@ -752,20 +815,23 @@ export class PhonePush {
   }
 
   /** One POST to the relay; null when it could not be reached. The credential travels only in the Authorization header,
-   * to the control plane's own origin, and is never logged. */
+   * to the control plane's own origin, and is never logged. A Cloud home's goes to its Admin, signed with its bootstrap
+   * secret, which never leaves this process: the same body, the same answers. */
   private async relay(path: string, body: unknown): Promise<RelayAnswer | null> {
     const access = this.options.access();
     if (!access) return null;
+    const request = "credential" in access
+      ? { url: `${access.controlPlane}${path}`, init: { method: "POST", headers: { authorization: `Bearer ${access.credential}`, "content-type": "application/json" }, body: JSON.stringify(body) } }
+      : cloudHomePushRequest(access, path, body, this.now());
+    if (!request) return null;
     try {
-      const response = await this.fetchImpl(`${access.controlPlane}${path}`, {
-        method: "POST",
-        headers: { authorization: `Bearer ${access.credential}`, "content-type": "application/json" },
-        body: JSON.stringify(body),
-        redirect: "error",
-        signal: AbortSignal.timeout(RELAY_TIMEOUT_MS),
-      });
+      const response = await this.fetchImpl(request.url, { ...request.init, redirect: "error", signal: AbortSignal.timeout(RELAY_TIMEOUT_MS) });
       const payload = await response.json().catch(() => null) as { error?: unknown } | null;
       const retryAfter = Number(response.headers.get("retry-after"));
+      const code = typeof payload?.error === "string" ? payload.error : undefined;
+      if (!("credential" in access) && (code === PUSH_RELAY_ERRORS.unavailable || (response.status === 404 && code !== PUSH_RELAY_ERRORS.unknownDevice))) {
+        this.refusedUntil = this.now() + RELAY_UNAVAILABLE_PAUSE_MS;
+      }
       return {
         status: response.status,
         ...(typeof payload?.error === "string" ? { code: payload.error } : {}),
@@ -779,7 +845,7 @@ export class PhonePush {
 }
 
 /** A validated access pair, or null. */
-export function phonePushAccess(controlPlane: unknown, credential: unknown): PhonePushAccess | null {
+export function phonePushAccess(controlPlane: unknown, credential: unknown): InstallationPushAccess | null {
   const origin = typeof controlPlane === "string" ? normalizeControlPlaneURL(controlPlane) : "";
   if (!origin || typeof credential !== "string" || !INSTALLATION_CREDENTIAL.test(credential)) return null;
   return { controlPlane: origin, credential };
@@ -787,15 +853,18 @@ export function phonePushAccess(controlPlane: unknown, credential: unknown): Pho
 
 /** Where this server's control-plane access comes from, first match wins: the desktop app's private message (its
  * credential lives in the OS store this process cannot read), OMB_PUSH_CREDENTIAL, a fleet's
- * OMB_INSTALLATION_CREDENTIAL, `openmausbot login`'s tunnel-account.json. OMB_CONTROL_PLANE_URL overrides the origin. */
+ * OMB_INSTALLATION_CREDENTIAL, `openmausbot login`'s tunnel-account.json. OMB_CONTROL_PLANE_URL overrides the origin.
+ * Last, a Cloud home (server/cloud-home.ts) with none of those: its Admin relays, signed with its bootstrap secret. */
 export class PhonePushAccessSource {
-  private desktop: PhonePushAccess | null | undefined;
+  private desktop: InstallationPushAccess | null | undefined;
   private readonly env: NodeJS.ProcessEnv;
   private readonly options: { tunnelFile: string; defaultControlPlane: string };
+  private readonly cloudHome: CloudHomePushAccess | null;
 
-  constructor(options: { env?: NodeJS.ProcessEnv; tunnelFile: string; defaultControlPlane: string }) {
+  constructor(options: { env?: NodeJS.ProcessEnv; tunnelFile: string; defaultControlPlane: string; cloudHome?: { adminOrigin: string; machineId: string; bootstrapSecret: string } | null }) {
     this.env = options.env ?? process.env;
     this.options = options;
+    this.cloudHome = cloudHomePushAccess(options.cloudHome);
   }
 
   /** The desktop app's message: true when it was one. */
@@ -821,9 +890,9 @@ export class PhonePushAccessSource {
     try {
       document = JSON.parse(readFileSync(this.options.tunnelFile, "utf8"));
     } catch {
-      return null;
+      return this.cloudHome;
     }
     const credential = document && typeof document === "object" ? (document as Record<string, unknown>)[COMPANION_INSTALLATION_CREDENTIAL_FIELD] : undefined;
-    return phonePushAccess(this.controlPlane(), credential);
+    return phonePushAccess(this.controlPlane(), credential) ?? this.cloudHome;
   }
 }

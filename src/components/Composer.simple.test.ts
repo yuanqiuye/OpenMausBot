@@ -135,6 +135,31 @@ describe("the Simple composer in a bot chat", () => {
     expect(menu()!.className.split(" ")).toEqual(expect.arrayContaining(["popover-surface", "rounded-[12px]", "w-max", "min-w-[200px]", "max-w-[280px]"]));
   });
 
+  it("has no place picker, and only marks a conversation an Advanced choice put somewhere other than its bot", () => {
+    const onVm = { ...bot, computer: "vm" as const };
+    const chat = (surface?: "cloud" | "vm", surfaceAuto?: true) => ({ ...onVm, tasks: [{ threadId: bot.threadId, title: "Chat", createdAt: 1, surface, surfaceAuto }] });
+    render({ bot: chat() });
+    expect(container.querySelector('[data-testid="place-chip"]')).toBeNull();
+    expect(container.querySelector('[data-testid="place-mark"]')).toBeNull();
+    openPlus();
+    expect([...menu()!.querySelectorAll("[data-menu-key]")].map((row) => row.getAttribute("data-menu-key"))).toEqual(["attach", "goal", "teach"]);
+    expect(document.body.textContent).not.toContain("Works on");
+
+    for (const [shown, marked] of [[chat("cloud"), true], [chat("vm"), false], [chat("cloud", true), false]] as const) {
+      flushSync(() => root.unmount());
+      root = createRoot(container);
+      render({ bot: shown });
+      const mark = container.querySelector<HTMLElement>('[data-testid="place-mark"]');
+      expect(Boolean(mark), JSON.stringify(shown.tasks)).toBe(marked);
+      expect(container.querySelector('[data-testid="place-chip"]')).toBeNull();
+      if (!mark) continue;
+      expect(mark.getAttribute("aria-label")).toBe("Where this conversation works: Cloud desktop");
+      expect(mark.closest("button")).toBeNull();
+      expect(mark.querySelector("button, [role=menu], [tabindex]")).toBeNull();
+    }
+    expect(fixture.dispatch).not.toHaveBeenCalledWith(expect.objectContaining({ type: "updateTask" }));
+  });
+
   it("starts a /learn draft from Teach a task, ahead of anything already typed", () => {
     restoreComposerDraft(`bot:${bot.id}:${bot.threadId}`, { text: "how I file expenses", attachments: [] });
     render({ bot });
@@ -319,4 +344,33 @@ it.each([false, true])("keeps Call for a shared viewer without Stop permission (
   render({ bot: shared });
   expect(container.querySelector('[aria-label="Stop this turn"]')).toBeNull();
   expect(fixture.call).toMatchObject({ bot: { id: "atlas" }, placement: "composer" });
+});
+
+it("a My Cloud bot open in place has no call here, and a file dropped on it says where files go instead of uploading", async () => {
+  const placed: Bot = { ...bot, id: "cloud:atlas", threadId: "cloud:atlas-thread" };
+  restoreComposerDraft(`bot:${placed.id}:${placed.threadId}`, { text: "", attachments: [] });
+  const uploads = vi.fn(async () => new Response("{}"));
+  vi.stubGlobal("fetch", uploads);
+  render({ bot: placed });
+  expect(fixture.call).toBeNull();
+  const field = container.querySelector("textarea")!;
+  const file = new File(["png"], "flat.png", { type: "image/png" });
+  const paste = new Event("paste", { bubbles: true, cancelable: true });
+  Object.defineProperty(paste, "clipboardData", { value: { files: [file], items: [{ kind: "file", type: "image/png", getAsFile: () => file }], types: ["Files"], getData: () => "" } });
+  flushSync(() => field.dispatchEvent(paste));
+  await vi.waitFor(() => expect(container.textContent).toContain("To send files to a My Cloud bot, open it on My Cloud's page"));
+  expect(uploads).not.toHaveBeenCalled();
+});
+
+it("a file picked for a My Cloud bot open in place says where files go and is never uploaded here", async () => {
+  const placed: Bot = { ...bot, id: "cloud:atlas", threadId: "cloud:atlas-thread" };
+  restoreComposerDraft(`bot:${placed.id}:${placed.threadId}`, { text: "", attachments: [] });
+  const uploads = vi.fn(async () => new Response("{}"));
+  vi.stubGlobal("fetch", uploads);
+  render({ bot: placed });
+  const input = container.querySelector<HTMLInputElement>('input[type="file"]')!;
+  Object.defineProperty(input, "files", { configurable: true, value: [new File(["%PDF"], "lease.pdf", { type: "application/pdf" })] });
+  flushSync(() => input.dispatchEvent(new Event("change", { bubbles: true })));
+  await vi.waitFor(() => expect(container.textContent).toContain("To send files to a My Cloud bot, open it on My Cloud's page"));
+  expect(uploads).not.toHaveBeenCalled();
 });

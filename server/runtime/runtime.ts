@@ -20,6 +20,9 @@ export interface RuntimeOptions {
   log?: (line: string) => void;
   /** Turns a restart cut start again at most one per this many ms (default RERUN_GAP_MS). */
   rerunGapMs?: number;
+  /** What a turn a restart cut, which would start again, ends with instead; null to start it again (memory-freeze-restart.ts:
+   * a turn that browsed when the server froze for want of memory). */
+  restartCut?: (threadId: string, startedAt: number | undefined) => string | null;
 }
 
 /** After a restart, the first RERUN_BURST turns it cut start again at once and the rest one at a time this far apart: a
@@ -52,6 +55,8 @@ const BRIEF_MAX = 12_000;
 const RESULT_MAX = 12_000;
 const STOPPED_WITH_REQUEST = "Stopped with the request it was for";
 const DETAIL_MAX = 400;
+/** Ticks a settlement the store refused is retried on; past them it is dropped, so the tree's own expiry ends it. */
+const SETTLE_RETRIES = 5;
 /** progress() runs once per runtime event; lastActivityAt catches up at this cadence, not per event. */
 export const PROGRESS_WRITE_MS = 10_000;
 
@@ -82,12 +87,15 @@ export class Runtime {
   private readonly rootActivity = new Map<string, number>();
   private readonly heldFor = new Map<string, string>();
   private readonly reportDue = new Set<string>();
+  /** Results whose SQLite settlement threw: retried each tick, deleted only once the transition commits. */
+  private readonly pendingSettlements = new Map<string, { live: LiveTurn | undefined; result: RunResult; executions: number; attempts: number }>();
   private batch: Map<string, Assignment> | null = null;
   private lastThrew = false;
   private readonly rerunGapMs: number;
   /** Monotonic: no turn a restart cut starts before this. */
   private nextRerunAt = Number.NEGATIVE_INFINITY;
   private rerunsStarted = 0;
+  private readonly restartCut: RuntimeOptions["restartCut"];
 
   constructor(store: RuntimeStore, runner: TurnRunner, options: RuntimeOptions = {}) {
     this.store = store;
@@ -98,6 +106,7 @@ export class Runtime {
     this.log = options.log ?? (line => console.error("runtime:", line));
     this.bootAt = this.clock.now();
     this.rerunGapMs = options.rerunGapMs ?? RERUN_GAP_MS;
+    this.restartCut = options.restartCut;
   }
 
   /** Restart reconciliation and re-park of needs_input, from stored data only. Idempotent; runs before the first tick. */
@@ -119,6 +128,7 @@ export class Runtime {
         }
         if (n.status !== "running") continue;
         const carried = n.carrying ?? [];
+        let stop: string | null;
         const handedOut = childrenSince(this.store, n).length > 0;
         const outward = handedOut ? [] : this.outwardOf(n);
         if (handedOut) {
@@ -131,6 +141,9 @@ export class Runtime {
         } else if (n.restart === "rerun") {
           this.store.update(n, { kind: "restart_reconciled", at: now, detail: "failed: cut twice" });
           this.settle(n, "failed", "interrupted", CUT_TWICE);
+        } else if ((stop = this.safe("restartCut", () => this.restartCut?.(n.assignee.destination.threadId, n.startedAt)) ?? null) !== null) {
+          this.store.update(n, { kind: "restart_reconciled", at: now, detail: "failed: froze for want of memory" });
+          this.settle(n, "failed", "interrupted", stop);
         } else {
           n.restart = "rerun"; n.restarts += 1; n.lastActivityAt = now;
           n.status = this.store.children(n.id).length ? "resume" : "queued";
@@ -187,7 +200,9 @@ export class Runtime {
     try {
       this.withBatch(() => this.finishTurn(n, outcome, live));
     } catch (error) {
-      this.log(`end(${rootId}) failed: ${String(error)}`);
+      // The same loss as turnEnded: keep the outcome and settle it on a later tick.
+      this.pendingSettlements.set(rootId, { live, result: outcome, executions: n.executions, attempts: 0 });
+      this.log(`end(${rootId}) failed, will retry: ${String(error)}`);
     }
   }
 
@@ -305,6 +320,8 @@ export class Runtime {
   }
 
   private tickBody(): void {
+    // First: settle any result the store refused earlier, before the windows below read it as stalled.
+    this.retrySettlements();
     const now = this.clock.now();
     const mono = this.clock.monotonic();
     const live = this.store.all({ nonTerminal: true });
@@ -340,7 +357,7 @@ export class Runtime {
       const anchor = Math.max(this.since(root.lastActivityAt), this.rootActivity.get(rootId) ?? 0);
       if (now - anchor <= this.limits.stallMs) continue;
       const tree = this.store.all({ rootId });
-      if (tree.some(n => n.status === "needs_input" || (n.status === "queued" && (n.continuation !== undefined || this.away(n))) || (n.status === "running" && this.away(n)))) continue;
+      if (tree.some(n => n.status === "needs_input" || (n.status === "queued" && (n.continuation !== undefined || this.away(n))) || (n.status === "running" && this.away(n))) || tree.some(n => this.pendingSettlements.has(n.id))) continue;
       if (now - Math.max(anchor, ...tree.map(n => this.heldAway.get(n.id) ?? 0)) <= this.limits.stallMs) continue;
       this.store.update(root, { kind: "stalled", at: now, detail: `no progress for ${duration(now - anchor)}` });
       this.cancelTree(root, `no progress for ${duration(this.limits.stallMs)}`, "failed", "stalled");
@@ -501,14 +518,45 @@ export class Runtime {
 
   /** Only the live handle's result settles the node: an ended, cancelled or stalled turn has no handle. */
   private turnEnded(id: string, live: LiveTurn, result: RunResult): void {
+    let executions: number | undefined;
     try {
       if (this.turns.get(id) !== live) return;
       const n = this.store.get(id);
       if (!n || n.status !== "running") return;
       if (this.closing && result.kind === "failed") return;
+      executions = n.executions;
       this.withBatch(() => this.finishTurn(n, result, live));
     } catch (error) {
-      this.log(`settling ${id} failed: ${String(error)}`);
+      // The completed result exists only here: keep it and settle from it on a later tick, instead of
+      // leaving the node running with no live turn and nothing left to settle it.
+      if (executions !== undefined) this.pendingSettlements.set(id, { live, result, executions, attempts: 0 });
+      this.log(`settling ${id} failed${executions !== undefined ? ", will retry" : ""}: ${String(error)}`);
+    }
+  }
+
+  /** Settles a node from the result it ended with: the pending record is dropped only once the transition commits,
+   * or the node is gone. While one is pending the node is exempt from the tree's inactivity expiry (tickBody). */
+  private retrySettlements(): void {
+    if (this.pendingSettlements.size === 0) return;
+    for (const [id, pending] of this.pendingSettlements) {
+      const n = this.store.get(id);
+      // Only a still-running node may take the stored result: a node that left
+      // running some other way (needs_input, cancelled tree) must not have a
+      // stale settlement replayed onto it.
+      // A node dispatched again since is running another turn: the stored result is not that turn's.
+      if (!n || isTerminal(n) || n.status !== "running" || n.executions !== pending.executions) {
+        this.pendingSettlements.delete(id);
+        continue;
+      }
+      try {
+        this.withBatch(() => this.finishTurn(n, pending.result, pending.live));
+        this.pendingSettlements.delete(id);
+      } catch (error) {
+        pending.attempts += 1;
+        const giveUp = pending.attempts >= SETTLE_RETRIES;
+        if (giveUp) this.pendingSettlements.delete(id);
+        this.log(`settling ${id} failed again, ${giveUp ? `giving up after ${SETTLE_RETRIES} retries` : "still pending"}: ${String(error)}`);
+      }
     }
   }
 
