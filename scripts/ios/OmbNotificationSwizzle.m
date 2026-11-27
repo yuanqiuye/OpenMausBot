@@ -22,11 +22,17 @@ static os_unfair_lock gStateLock = OS_UNFAIR_LOCK_INIT;
 static BOOL gAppStateKnown = NO;
 static BOOL gInBackground = NO;
 static BOOL gRctHostHooked = NO;
+static BOOL gAuthPromptedNative = NO;
+static BOOL gAuthGrantedThisSession = NO;
 static NSHashTable<NSURLSessionTask *> *gActiveSseTasks = nil;
 static NSString *gCapturedApiBase = nil;
 static NSString *gCapturedAuthHeader = nil;
 static NSString *gCapturedCookieHeader = nil;
-static NSMutableDictionary<NSString *, NSString *> *gPendingActivityTokens = nil;
+static NSString *gCapturedLoopbackHeader = nil;
+static NSDictionary<NSString *, id> *gLastDeviceRegDict = nil;
+static NSDictionary<NSString *, id> *gLastActivityRegDict = nil;
+static NSMutableDictionary<NSString *, NSString *> *gActivityBotIds = nil;
+static NSMutableDictionary<NSString *, NSDictionary<NSString *, NSString *> *> *gPendingActivityTokens = nil;
 static NSURLSession *gInternalSession = nil;
 static UIBackgroundTaskIdentifier gActivityBgTask = 0;
 static NSUInteger gInFlightTokenPosts = 0;
@@ -96,29 +102,47 @@ static NSURLSession *omb_shared_internal_session(void) {
   return session;
 }
 
-static void omb_send_activity_token_post(
-  NSString *apiBase,
-  NSString * _Nullable authHeader,
-  NSString * _Nullable cookieHeader,
-  NSString *token,
-  NSString * _Nullable activityId
+static void omb_finish_in_flight_token_op(
+  BOOL shouldRequeue,
+  NSString * _Nullable token,
+  NSString * _Nullable activityId,
+  NSString * _Nullable botId
 ) {
-  NSURL *url = [NSURL URLWithString:[apiBase stringByAppendingString:@"/api/push/activity"]];
-  if (!url) return;
-
-  NSMutableDictionary<NSString *, NSString *> *payload = [NSMutableDictionary dictionaryWithCapacity:2];
-  payload[@"token"] = token;
-  if (activityId.length > 0) {
-    payload[@"activityId"] = activityId;
+  os_unfair_lock_lock(&gStateLock);
+  if (shouldRequeue && token.length > 0 && gPendingActivityTokens.count < 10) {
+    if (!gPendingActivityTokens) {
+      gPendingActivityTokens = [NSMutableDictionary dictionary];
+    }
+    gPendingActivityTokens[token] = @{
+      @"activityId": activityId ?: @"",
+      @"botId": botId ?: @"",
+    };
   }
-  NSError *jsonErr = nil;
-  NSData *body = [NSJSONSerialization dataWithJSONObject:payload options:0 error:&jsonErr];
-  if (!body || jsonErr) return;
+  if (gInFlightTokenPosts > 0) {
+    gInFlightTokenPosts -= 1;
+  }
+  if (gInFlightTokenPosts == 0 && gPendingActivityTokens.count == 0) {
+    omb_end_activity_bg_task_locked();
+  }
+  os_unfair_lock_unlock(&gStateLock);
+}
 
+static NSMutableURLRequest * _Nullable omb_make_internal_request(
+  NSString *apiBase,
+  NSString *path,
+  NSString *method,
+  NSData * _Nullable body,
+  NSString * _Nullable authHeader,
+  NSString * _Nullable cookieHeader
+) {
+  NSURL *url = [NSURL URLWithString:[apiBase stringByAppendingString:path]];
+  if (!url) return nil;
   NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url];
-  req.HTTPMethod = @"POST";
-  req.HTTPBody = body;
-  [req setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
+  req.HTTPMethod = method;
+  if (body) {
+    req.HTTPBody = body;
+    [req setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
+  }
   [req setValue:@"1" forHTTPHeaderField:@"X-OMB-Internal-Bridge"];
   if (authHeader.length > 0) {
     [req setValue:authHeader forHTTPHeaderField:@"Authorization"];
@@ -126,6 +150,207 @@ static void omb_send_activity_token_post(
   if (cookieHeader.length > 0) {
     [req setValue:cookieHeader forHTTPHeaderField:@"Cookie"];
   }
+  NSString *loopbackHeader = nil;
+  os_unfair_lock_lock(&gStateLock);
+  loopbackHeader = [gCapturedLoopbackHeader copy];
+  os_unfair_lock_unlock(&gStateLock);
+  if (loopbackHeader.length > 0 && [url.host isEqualToString:@"127.0.0.1"]) {
+    [req setValue:loopbackHeader forHTTPHeaderField:@"X-OpenMausBot-Loopback"];
+  }
+  return req;
+}
+
+static void omb_put_json_dictionary(
+  NSString *apiBase,
+  NSString *path,
+  NSDictionary<NSString *, id> *payload,
+  NSString * _Nullable authHeader,
+  NSString * _Nullable cookieHeader,
+  void (^ _Nullable completion)(NSInteger status, NSError * _Nullable error)
+) {
+  if (![NSJSONSerialization isValidJSONObject:payload]) {
+    if (completion) completion(0, nil);
+    return;
+  }
+  NSError *jsonErr = nil;
+  NSData *body = [NSJSONSerialization dataWithJSONObject:payload options:0 error:&jsonErr];
+  if (!body || jsonErr) {
+    if (completion) completion(0, jsonErr);
+    return;
+  }
+  NSMutableURLRequest *req = omb_make_internal_request(apiBase, path, @"PUT", body, authHeader, cookieHeader);
+  if (!req) {
+    if (completion) completion(0, nil);
+    return;
+  }
+  NSURLSessionDataTask *task = [omb_shared_internal_session()
+    dataTaskWithRequest:req
+      completionHandler:^(__unused NSData * _Nullable data, NSURLResponse * _Nullable response, NSError * _Nullable error) {
+        NSInteger status = [response isKindOfClass:[NSHTTPURLResponse class]]
+          ? ((NSHTTPURLResponse *)response).statusCode
+          : 0;
+        if (completion) completion(status, error);
+      }];
+  [task resume];
+}
+
+static void omb_resolve_bot_id_if_missing(
+  NSString *apiBase,
+  NSString * _Nullable authHeader,
+  NSString * _Nullable cookieHeader,
+  NSString * _Nullable currentBotId,
+  NSDictionary<NSString *, id> * _Nullable baseReg,
+  void (^completion)(NSString * _Nullable resolvedBotId)
+) {
+  if (currentBotId.length > 0) {
+    completion(currentBotId);
+    return;
+  }
+  NSDictionary *visuals = [baseReg[@"visuals"] isKindOfClass:[NSDictionary class]] ? baseReg[@"visuals"] : nil;
+  if (visuals.count == 1) {
+    id onlyKey = visuals.allKeys.firstObject;
+    if ([onlyKey isKindOfClass:[NSString class]] && ((NSString *)onlyKey).length > 0) {
+      completion((NSString *)onlyKey);
+      return;
+    }
+  }
+
+  NSMutableURLRequest *req = omb_make_internal_request(apiBase, @"/api/bots?messages=0", @"GET", nil, authHeader, cookieHeader);
+  if (!req) {
+    completion(nil);
+    return;
+  }
+  NSURLSessionDataTask *task = [omb_shared_internal_session()
+    dataTaskWithRequest:req
+      completionHandler:^(NSData * _Nullable data, NSURLResponse * _Nullable response, NSError * _Nullable error) {
+        NSInteger status = [response isKindOfClass:[NSHTTPURLResponse class]]
+          ? ((NSHTTPURLResponse *)response).statusCode
+          : 0;
+        if (error || status < 200 || status >= 300 || data.length == 0) {
+          completion(nil);
+          return;
+        }
+        id parsed = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+        NSArray *bots = nil;
+        if ([parsed isKindOfClass:[NSDictionary class]] && [parsed[@"bots"] isKindOfClass:[NSArray class]]) {
+          bots = parsed[@"bots"];
+        } else if ([parsed isKindOfClass:[NSArray class]]) {
+          bots = parsed;
+        }
+        if (bots.count == 1 && [bots.firstObject isKindOfClass:[NSDictionary class]]) {
+          id firstId = bots.firstObject[@"id"];
+          if ([firstId isKindOfClass:[NSString class]]) {
+            completion((NSString *)firstId);
+            return;
+          }
+        }
+        for (id item in bots) {
+          if (![item isKindOfClass:[NSDictionary class]]) continue;
+          NSString *bid = [item[@"id"] isKindOfClass:[NSString class]] ? item[@"id"] : nil;
+          if (bid.length == 0) continue;
+          NSArray *tasks = [item[@"tasks"] isKindOfClass:[NSArray class]] ? item[@"tasks"] : nil;
+          for (id t in tasks) {
+            if (![t isKindOfClass:[NSDictionary class]]) continue;
+            NSString *act = [t[@"activity"] isKindOfClass:[NSString class]] ? t[@"activity"] : @"";
+            if ([act isEqualToString:@"working"] || [act isEqualToString:@"waiting-on-you"]) {
+              completion(bid);
+              return;
+            }
+          }
+        }
+        if (bots.count > 0 && [bots.firstObject isKindOfClass:[NSDictionary class]]) {
+          id fallbackId = bots.firstObject[@"id"];
+          if ([fallbackId isKindOfClass:[NSString class]]) {
+            completion((NSString *)fallbackId);
+            return;
+          }
+        }
+        completion(nil);
+      }];
+  [task resume];
+}
+
+static void omb_fallback_put_activity_token(
+  NSString *apiBase,
+  NSString * _Nullable authHeader,
+  NSString * _Nullable cookieHeader,
+  NSString *token,
+  NSString * _Nullable activityId,
+  NSString * _Nullable botId
+) {
+  NSDictionary<NSString *, id> *baseReg = nil;
+  BOOL authGranted = NO;
+  os_unfair_lock_lock(&gStateLock);
+  baseReg = [gLastActivityRegDict copy];
+  authGranted = gAuthGrantedThisSession;
+  os_unfair_lock_unlock(&gStateLock);
+
+  if (!baseReg) {
+    omb_finish_in_flight_token_op(YES, token, activityId, botId);
+    return;
+  }
+
+  omb_resolve_bot_id_if_missing(apiBase, authHeader, cookieHeader, botId, baseReg, ^(NSString * _Nullable resolvedBotId) {
+    if (resolvedBotId.length == 0) {
+      omb_finish_in_flight_token_op(NO, token, activityId, botId);
+      return;
+    }
+
+    NSMutableDictionary<NSString *, id> *mutableReg = nil;
+    os_unfair_lock_lock(&gStateLock);
+    NSDictionary<NSString *, id> *latest = gLastActivityRegDict ?: baseReg;
+    mutableReg = [latest mutableCopy];
+    NSArray *existingActs = [mutableReg[@"activities"] isKindOfClass:[NSArray class]] ? mutableReg[@"activities"] : @[];
+    NSMutableArray<NSDictionary<NSString *, NSString *> *> *merged = [NSMutableArray array];
+    for (id entry in existingActs) {
+      if (![entry isKindOfClass:[NSDictionary class]]) continue;
+      NSString *eb = [entry[@"botId"] isKindOfClass:[NSString class]] ? entry[@"botId"] : @"";
+      NSString *et = [entry[@"token"] isKindOfClass:[NSString class]] ? entry[@"token"] : @"";
+      if (eb.length == 0 || et.length == 0) continue;
+      if ([eb isEqualToString:resolvedBotId] || [et isEqualToString:token]) continue;
+      [merged addObject:@{ @"botId": eb, @"token": et }];
+    }
+    [merged addObject:@{ @"botId": resolvedBotId, @"token": token }];
+    while (merged.count > 10) {
+      [merged removeObjectAtIndex:0];
+    }
+    mutableReg[@"activities"] = [merged copy];
+    [mutableReg removeObjectForKey:@"startToken"];
+    if (authGranted && [mutableReg[@"kinds"] isKindOfClass:[NSArray class]] && ((NSArray *)mutableReg[@"kinds"]).count == 0) {
+      mutableReg[@"kinds"] = @[@"needsYou", @"working"];
+    }
+    gLastActivityRegDict = [mutableReg copy];
+    os_unfair_lock_unlock(&gStateLock);
+
+    omb_put_json_dictionary(apiBase, @"/api/push/activity", mutableReg, authHeader, cookieHeader, ^(NSInteger status, NSError * _Nullable error) {
+      BOOL retry = (error != nil || status >= 500);
+      omb_finish_in_flight_token_op(retry, token, activityId, resolvedBotId);
+    });
+  });
+}
+
+static void omb_send_activity_token_post(
+  NSString *apiBase,
+  NSString * _Nullable authHeader,
+  NSString * _Nullable cookieHeader,
+  NSString *token,
+  NSString * _Nullable activityId,
+  NSString * _Nullable botId
+) {
+  NSMutableDictionary<NSString *, NSString *> *payload = [NSMutableDictionary dictionaryWithCapacity:3];
+  payload[@"token"] = token;
+  if (activityId.length > 0) {
+    payload[@"activityId"] = activityId;
+  }
+  if (botId.length > 0) {
+    payload[@"botId"] = botId;
+  }
+  NSError *jsonErr = nil;
+  NSData *body = [NSJSONSerialization dataWithJSONObject:payload options:0 error:&jsonErr];
+  if (!body || jsonErr) return;
+
+  NSMutableURLRequest *req = omb_make_internal_request(apiBase, @"/api/push/activity", @"POST", body, authHeader, cookieHeader);
+  if (!req) return;
 
   os_unfair_lock_lock(&gStateLock);
   gInFlightTokenPosts += 1;
@@ -137,17 +362,13 @@ static void omb_send_activity_token_post(
         NSInteger status = [response isKindOfClass:[NSHTTPURLResponse class]]
           ? ((NSHTTPURLResponse *)response).statusCode
           : 0;
-        os_unfair_lock_lock(&gStateLock);
-        if ((error != nil || status >= 500) && gPendingActivityTokens.count < 10) {
-          gPendingActivityTokens[token] = activityId ?: @"";
+        // Companion <= v0.1.180 allowlists PUT /api/push/activity and returns 403 on POST.
+        if (error == nil && (status == 403 || status == 404 || status == 405)) {
+          omb_fallback_put_activity_token(apiBase, authHeader, cookieHeader, token, activityId, botId);
+          return;
         }
-        if (gInFlightTokenPosts > 0) {
-          gInFlightTokenPosts -= 1;
-        }
-        if (gInFlightTokenPosts == 0 && gPendingActivityTokens.count == 0) {
-          omb_end_activity_bg_task_locked();
-        }
-        os_unfair_lock_unlock(&gStateLock);
+        BOOL retry = (error != nil || status >= 500);
+        omb_finish_in_flight_token_op(retry, token, activityId, botId);
       }];
   [task resume];
 }
@@ -156,7 +377,7 @@ static void omb_flush_pending_tokens(void) {
   NSString *apiBase = nil;
   NSString *auth = nil;
   NSString *cookie = nil;
-  NSDictionary<NSString *, NSString *> *snapshot = nil;
+  NSDictionary<NSString *, NSDictionary<NSString *, NSString *> *> *snapshot = nil;
 
   os_unfair_lock_lock(&gStateLock);
   if (gCapturedApiBase.length > 0 && (gCapturedAuthHeader.length > 0 || gCapturedCookieHeader.length > 0) && gPendingActivityTokens.count > 0) {
@@ -169,20 +390,159 @@ static void omb_flush_pending_tokens(void) {
   os_unfair_lock_unlock(&gStateLock);
 
   if (!snapshot.count) return;
-  [snapshot enumerateKeysAndObjectsUsingBlock:^(NSString *token, NSString *activityId, __unused BOOL *stop) {
-    omb_send_activity_token_post(apiBase, auth, cookie, token, activityId);
+  [snapshot enumerateKeysAndObjectsUsingBlock:^(NSString *token, NSDictionary<NSString *, NSString *> *meta, __unused BOOL *stop) {
+    omb_send_activity_token_post(apiBase, auth, cookie, token, meta[@"activityId"], meta[@"botId"]);
   }];
 }
 
-static void omb_queue_or_send_activity_token(NSString *token, NSString * _Nullable activityId) {
+static void omb_queue_or_send_activity_token(
+  NSString *token,
+  NSString * _Nullable activityId,
+  NSString * _Nullable botId
+) {
   if (token.length < 32 || token.length > 512) return;
+  NSString *effectiveBotId = botId;
   os_unfair_lock_lock(&gStateLock);
+  if (!gActivityBotIds) {
+    gActivityBotIds = [NSMutableDictionary dictionary];
+  }
+  if (activityId.length > 0 && botId.length > 0) {
+    gActivityBotIds[activityId] = botId;
+  } else if (effectiveBotId.length == 0 && activityId.length > 0) {
+    effectiveBotId = gActivityBotIds[activityId];
+  }
   if (!gPendingActivityTokens) {
     gPendingActivityTokens = [NSMutableDictionary dictionary];
   }
-  gPendingActivityTokens[token.lowercaseString] = activityId ?: @"";
+  gPendingActivityTokens[token.lowercaseString] = @{
+    @"activityId": activityId ?: @"",
+    @"botId": effectiveBotId ?: @"",
+  };
   os_unfair_lock_unlock(&gStateLock);
   omb_flush_pending_tokens();
+}
+
+static void omb_replay_authorized_registrations_if_needed(void) {
+  NSString *apiBase = nil;
+  NSString *auth = nil;
+  NSString *cookie = nil;
+  NSMutableDictionary<NSString *, id> *devCopy = nil;
+  NSMutableDictionary<NSString *, id> *actCopy = nil;
+
+  os_unfair_lock_lock(&gStateLock);
+  if (gAuthGrantedThisSession && gCapturedApiBase.length > 0 && (gCapturedAuthHeader.length > 0 || gCapturedCookieHeader.length > 0)) {
+    apiBase = [gCapturedApiBase copy];
+    auth = [gCapturedAuthHeader copy];
+    cookie = [gCapturedCookieHeader copy];
+    if (gLastDeviceRegDict && [gLastDeviceRegDict[@"kinds"] isKindOfClass:[NSArray class]] && ((NSArray *)gLastDeviceRegDict[@"kinds"]).count == 0) {
+      devCopy = [gLastDeviceRegDict mutableCopy];
+      devCopy[@"kinds"] = @[@"approval", @"question", @"sign-in", @"done"];
+      gLastDeviceRegDict = [devCopy copy];
+    }
+    if (gLastActivityRegDict) {
+      BOOL emptyActKinds = [gLastActivityRegDict[@"kinds"] isKindOfClass:[NSArray class]] && ((NSArray *)gLastActivityRegDict[@"kinds"]).count == 0;
+      BOOL hadStartToken = gLastActivityRegDict[@"startToken"] != nil;
+      if (emptyActKinds || hadStartToken) {
+        actCopy = [gLastActivityRegDict mutableCopy];
+        [actCopy removeObjectForKey:@"startToken"];
+        if (emptyActKinds) {
+          actCopy[@"kinds"] = @[@"needsYou", @"working"];
+        }
+        gLastActivityRegDict = [actCopy copy];
+      }
+    }
+  }
+  os_unfair_lock_unlock(&gStateLock);
+
+  if (devCopy) {
+    omb_put_json_dictionary(apiBase, @"/api/push/device", devCopy, auth, cookie, nil);
+  }
+  if (actCopy) {
+    omb_put_json_dictionary(apiBase, @"/api/push/activity", actCopy, auth, cookie, nil);
+  }
+}
+
+static void omb_store_captured_reg_data(NSData * _Nullable bodyData, BOOL isActivity, BOOL fromOutgoingApiPut) {
+  if (bodyData.length == 0) return;
+  id parsed = [NSJSONSerialization JSONObjectWithData:bodyData options:0 error:nil];
+  if (![parsed isKindOfClass:[NSDictionary class]]) return;
+  BOOL shouldFlushTokens = NO;
+  BOOL shouldReplayAuth = NO;
+  NSString *stripReplayBase = nil;
+  NSString *stripReplayAuth = nil;
+  NSString *stripReplayCookie = nil;
+  NSDictionary<NSString *, id> *stripReplayBody = nil;
+  os_unfair_lock_lock(&gStateLock);
+  if (isActivity) {
+    BOOL hadStartToken = ((NSDictionary *)parsed)[@"startToken"] != nil;
+    NSMutableDictionary<NSString *, id> *sanitized = [(NSDictionary *)parsed mutableCopy];
+    [sanitized removeObjectForKey:@"startToken"];
+    gLastActivityRegDict = [sanitized copy];
+    shouldFlushTokens = (gPendingActivityTokens.count > 0);
+    if (fromOutgoingApiPut && hadStartToken && gCapturedApiBase.length > 0 && (gCapturedAuthHeader.length > 0 || gCapturedCookieHeader.length > 0)) {
+      stripReplayBase = [gCapturedApiBase copy];
+      stripReplayAuth = [gCapturedAuthHeader copy];
+      stripReplayCookie = [gCapturedCookieHeader copy];
+      stripReplayBody = [gLastActivityRegDict copy];
+    }
+  } else {
+    gLastDeviceRegDict = [(NSDictionary *)parsed copy];
+  }
+  if (gAuthGrantedThisSession && [parsed[@"kinds"] isKindOfClass:[NSArray class]] && ((NSArray *)parsed[@"kinds"]).count == 0) {
+    shouldReplayAuth = YES;
+  }
+  os_unfair_lock_unlock(&gStateLock);
+
+  if (shouldFlushTokens) {
+    omb_flush_pending_tokens();
+  }
+  if (stripReplayBody) {
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.30 * NSEC_PER_SEC)), dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+      omb_put_json_dictionary(stripReplayBase, @"/api/push/activity", stripReplayBody, stripReplayAuth, stripReplayCookie, nil);
+    });
+  }
+  if (shouldReplayAuth) {
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)), dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+      omb_replay_authorized_registrations_if_needed();
+    });
+  }
+}
+
+static void omb_ensure_notification_authorization_fallback(void) {
+  UNUserNotificationCenter *center = [UNUserNotificationCenter currentNotificationCenter];
+  if (!center) return;
+  [center getNotificationSettingsWithCompletionHandler:^(UNNotificationSettings * _Nonnull settings) {
+    UNAuthorizationStatus st = settings.authorizationStatus;
+    if (st == UNAuthorizationStatusAuthorized || st == UNAuthorizationStatusProvisional) {
+      dispatch_async(dispatch_get_main_queue(), ^{
+        [[UIApplication sharedApplication] registerForRemoteNotifications];
+      });
+      return;
+    }
+    if (st != UNAuthorizationStatusNotDetermined) {
+      return;
+    }
+    BOOL alreadyPrompted = NO;
+    os_unfair_lock_lock(&gStateLock);
+    alreadyPrompted = gAuthPromptedNative;
+    gAuthPromptedNative = YES;
+    os_unfair_lock_unlock(&gStateLock);
+    if (alreadyPrompted) return;
+
+    dispatch_async(dispatch_get_main_queue(), ^{
+      UNAuthorizationOptions opts = UNAuthorizationOptionAlert | UNAuthorizationOptionSound | UNAuthorizationOptionBadge;
+      [center requestAuthorizationWithOptions:opts completionHandler:^(BOOL granted, __unused NSError * _Nullable error) {
+        if (!granted) return;
+        os_unfair_lock_lock(&gStateLock);
+        gAuthGrantedThisSession = YES;
+        os_unfair_lock_unlock(&gStateLock);
+        dispatch_async(dispatch_get_main_queue(), ^{
+          [[UIApplication sharedApplication] registerForRemoteNotifications];
+        });
+        omb_replay_authorized_registrations_if_needed();
+      }];
+    });
+  }];
 }
 
 static void omb_capture_api_credentials(NSURL *url, NSURLRequest *req) {
@@ -192,6 +552,7 @@ static void omb_capture_api_credentials(NSURL *url, NSURLRequest *req) {
   NSString *base = [abs substringToIndex:apiRange.location];
   NSString *auth = [req valueForHTTPHeaderField:@"Authorization"];
   NSString *cookie = [req valueForHTTPHeaderField:@"Cookie"];
+  NSString *loopback = [req valueForHTTPHeaderField:@"X-OpenMausBot-Loopback"];
   if (auth.length == 0 && cookie.length == 0) return;
 
   BOOL shouldFlush = NO;
@@ -202,6 +563,11 @@ static void omb_capture_api_credentials(NSURL *url, NSURLRequest *req) {
   }
   if (cookie.length > 0) {
     gCapturedCookieHeader = [cookie copy];
+  }
+  if (loopback.length > 0) {
+    gCapturedLoopbackHeader = [loopback copy];
+  } else if (![url.host isEqualToString:@"127.0.0.1"]) {
+    gCapturedLoopbackHeader = nil;
   }
   shouldFlush = gPendingActivityTokens.count > 0;
   os_unfair_lock_unlock(&gStateLock);
@@ -309,16 +675,30 @@ static void omb_swizzled_task_resume(id self, SEL _cmd) {
   if ([host isEqualToString:@"omb-runtime-bridge.invalid"]) {
     NSURLComponents *components = [NSURLComponents componentsWithURL:url resolvingAgainstBaseURL:NO];
     NSString *actId = nil;
+    NSString *botId = nil;
     NSString *token = nil;
     for (NSURLQueryItem *item in components.queryItems) {
       if ([item.name isEqualToString:@"id"]) actId = item.value;
+      else if ([item.name isEqualToString:@"botId"]) botId = item.value;
       else if ([item.name isEqualToString:@"token"]) token = item.value;
     }
     if ([url.path isEqualToString:@"/activity-wake"]) {
-      omb_hold_activity_bg_task(8.0);
+      omb_hold_activity_bg_task(10.0);
+      if (actId.length > 0 && botId.length > 0) {
+        os_unfair_lock_lock(&gStateLock);
+        if (!gActivityBotIds) {
+          gActivityBotIds = [NSMutableDictionary dictionary];
+        }
+        gActivityBotIds[actId] = botId;
+        os_unfair_lock_unlock(&gStateLock);
+      }
     } else if ([url.path isEqualToString:@"/activity-token"] && token.length > 0) {
-      omb_hold_activity_bg_task(8.0);
-      omb_queue_or_send_activity_token(token, actId);
+      omb_hold_activity_bg_task(10.0);
+      omb_queue_or_send_activity_token(token, actId, botId);
+    } else if ([url.path isEqualToString:@"/activity-reg"]) {
+      omb_store_captured_reg_data(req.HTTPBody, YES, NO);
+    } else if ([url.path isEqualToString:@"/device-reg"]) {
+      omb_store_captured_reg_data(req.HTTPBody, NO, NO);
     }
     [task cancel];
     return;
@@ -327,6 +707,13 @@ static void omb_swizzled_task_resume(id self, SEL _cmd) {
   NSString *path = url.path;
   if (path.length > 0 && [path containsString:@"/api/"] && ![host isEqualToString:@"accounts.openmausbot.com"]) {
     omb_capture_api_credentials(url, req);
+    if ([req.HTTPMethod.uppercaseString isEqualToString:@"PUT"] && req.HTTPBody.length > 0) {
+      if ([path hasSuffix:@"/api/push/activity"]) {
+        omb_store_captured_reg_data(req.HTTPBody, YES, YES);
+      } else if ([path hasSuffix:@"/api/push/device"]) {
+        omb_store_captured_reg_data(req.HTTPBody, NO, YES);
+      }
+    }
     if ([path hasSuffix:@"/api/events"]) {
       if (omb_is_currently_in_background()) {
         [task cancel];
@@ -441,6 +828,9 @@ static void omb_install_app_lifecycle_observers(void) {
                    queue:[NSOperationQueue mainQueue]
               usingBlock:^(__unused NSNotification *note) {
                 (void)omb_set_background_and_take_sse_tasks(NO);
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                  omb_ensure_notification_authorization_fallback();
+                });
               }];
 
   dispatch_async(dispatch_get_main_queue(), ^{

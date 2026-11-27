@@ -222,6 +222,7 @@ const ALLOWED: ReadonlyArray<{ method: string; path: RegExp }> = [
   { method: "GET", path: /^\/api\/push\/device$/ },
   { method: "DELETE", path: /^\/api\/push\/device$/ },
   { method: "PUT", path: /^\/api\/push\/activity$/ },
+  { method: "POST", path: /^\/api\/push\/activity$/ },
   { method: "GET", path: /^\/api\/push\/activity$/ },
   { method: "DELETE", path: /^\/api\/push\/activity$/ },
 

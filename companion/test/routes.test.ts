@@ -35,6 +35,7 @@ describe("what the app may do", () => {
     ["GET", "/api/push/device"],
     ["DELETE", "/api/push/device"],
     ["PUT", "/api/push/activity"],
+    ["POST", "/api/push/activity"],
     ["GET", "/api/push/activity"],
     ["DELETE", "/api/push/activity"],
     ["GET", "/api/config"],
