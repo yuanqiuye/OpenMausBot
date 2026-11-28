@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
+vi.mock("../../electron/hosted-services.mjs", async (original) => ({ ...(await original<object>()), OPENMAUSBOT_HOSTED: true }));
 
 import { ApiError } from "@/state/store";
 import { keySaveFailure, keyTestResult, savedKeyResult } from "./product-events";

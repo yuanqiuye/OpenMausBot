@@ -2,6 +2,7 @@ import { track } from "@/lib/analytics";
 import { CLOUD_PLAN_URL, openExternalLink, withSource } from "@/lib/app-links";
 import type { CloudSource } from "@/lib/cloud-plan";
 import { WHATS_NEW_SOURCES } from "@/lib/whats-new";
+import { OPENMAUSBOT_HOSTED } from "../../electron/hosted-services.mjs";
 
 export type CloudAddRequest = { source: CloudSource; signIn?: true };
 
@@ -24,7 +25,8 @@ export function cloudWebHop(request: CloudAddRequest, place: { cloudHome: boolea
   return { url: withSource(buy.href, request.source), via: "web", plan };
 }
 
-export function openCloudOnWeb(request: CloudAddRequest, place: { cloudHome: boolean; teamCloudPage?: string }): void {
+export function openCloudOnWeb(request: CloudAddRequest, place: { cloudHome: boolean; teamCloudPage?: string }, hosted = OPENMAUSBOT_HOSTED): void {
+  if (!hosted) return;
   const hop = cloudWebHop(request, place);
   void openExternalLink(hop.url).catch(() => {});
   track("cloud_checkout_opened", { ...(hop.plan ? { plan: hop.plan } : {}), source: request.source, via: hop.via });

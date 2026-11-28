@@ -7,6 +7,7 @@ import { z } from "zod";
 
 import { DEVS_REPORT_LIMITS, withoutContact, type DevsReportPayload } from "./devs-report.ts";
 import { cloudSignedTimestamp } from "./cloud-clock.ts";
+import { OPENMAUSBOT_HOSTED } from "../electron/hosted-services.mjs";
 
 export const BUG_REPORT_PATH = "/api/bug-reports";
 export const PRODUCTION_CLOUD_ORIGIN = "https://cloud.openmausbot.com";
@@ -22,8 +23,8 @@ export type SendOutcome =
   | { ok: false; retry: false; why: "refused"; detail: string };
 
 /** OMB_BUG_REPORT_URL (an https address, or http on this machine's loopback, for fixtures), else a Cloud home's own
- * Admin origin, else the staging or production Cloud. */
-export function bugReportEndpoint(env: NodeJS.ProcessEnv, cloudOrigin?: string | null): string {
+ * Admin origin, else the staging or production Cloud where OpenMausBot's hosted services are offered; null otherwise. */
+export function bugReportEndpoint(env: NodeJS.ProcessEnv, cloudOrigin?: string | null, hosted: boolean = OPENMAUSBOT_HOSTED): string | null {
   const explicit = env.OMB_BUG_REPORT_URL?.trim();
   if (explicit) {
     try {
@@ -32,6 +33,7 @@ export function bugReportEndpoint(env: NodeJS.ProcessEnv, cloudOrigin?: string |
       if ((url.protocol === "https:" || loopback) && !url.username && !url.password) return url.href;
     } catch { /* not an address: the default below */ }
   }
+  if (!cloudOrigin && !hosted) return null;
   const origin = cloudOrigin ?? (env.OMB_CLOUD_STAGING === "1" ? STAGING_CLOUD_ORIGIN : PRODUCTION_CLOUD_ORIGIN);
   return `${origin.replace(/\/+$/, "")}${BUG_REPORT_PATH}`;
 }

@@ -3,6 +3,7 @@ import {
   normalizeAccountEmail,
   normalizeControlPlaneURL,
 } from "./control-plane-client.mjs";
+import { OPENMAUSBOT_HOSTED } from "./hosted-services.mjs";
 import {
   MANAGED_COMPANION_ENDPOINT_FIELD,
   MANAGED_COMPANION_RELEASE_AT_FIELD,
@@ -50,7 +51,7 @@ export { friendlyCompanionAccountError };
 
 export { managedEndpointNeed, PHONE_UNUSED_RELEASE_MS } from "./companion-endpoint-need.mjs";
 
-export const DEFAULT_COMPANION_CONTROL_PLANE_URL = "https://accounts.openmausbot.com";
+export const DEFAULT_COMPANION_CONTROL_PLANE_URL = OPENMAUSBOT_HOSTED ? "https://accounts.openmausbot.com" : "";
 
 const DEFAULT_HEALTH_CACHE_MS = 30_000;
 const DEFAULT_AUTO_RETRY_BASE_MS = 10 * 60_000;
@@ -102,6 +103,13 @@ export function resolveCompanionControlPlaneURL({
     return normalizeControlPlaneURL(environment.OMB_CONTROL_PLANE_URL);
   }
   return isPackaged ? DEFAULT_COMPANION_CONTROL_PLANE_URL : "";
+}
+
+/** Why resolveCompanionControlPlaneURL came back empty, as a person reads it. */
+export function controlPlaneMissingReason(environment = process.env) {
+  return Object.hasOwn(environment, "OMB_CONTROL_PLANE_URL")
+    ? "OMB_CONTROL_PLANE_URL is set but is not an https address"
+    : "this build connects to no OpenMausBot account service; set OMB_CONTROL_PLANE_URL to use one";
 }
 
 /** Nothing this service returns may contain an account bearer, installation credential, connector token or Cloudflare resource id. */

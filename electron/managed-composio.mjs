@@ -1,3 +1,5 @@
+import { OPENMAUSBOT_HOSTED } from "./hosted-services.mjs";
+
 const TOKEN = /^[0-9a-f]{64}$/;
 
 /** OpenMausBot's connected-apps service (cloudflare/composio-broker): the packaged desktop app and a Cloud home use it. */
@@ -14,10 +16,10 @@ export function ownComposioKey(credentials, environment = process.env) {
 }
 
 /** An explicit URL wins; otherwise the default, only for a shipped build, so development and tests never register. */
-export function managedComposioBrokerUrl(configured, shipped) {
+export function managedComposioBrokerUrl(configured, shipped, hosted = OPENMAUSBOT_HOSTED) {
   if (managedComposioBrokerOff()) return "";
   const explicit = typeof configured === "string" ? configured.trim() : "";
-  return normalizeManagedComposioBrokerUrl(explicit || (shipped ? DEFAULT_MANAGED_COMPOSIO_BROKER_URL : ""));
+  return normalizeManagedComposioBrokerUrl(explicit || (shipped && hosted ? DEFAULT_MANAGED_COMPOSIO_BROKER_URL : ""));
 }
 
 export function normalizeManagedComposioBrokerUrl(value) {

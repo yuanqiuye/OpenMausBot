@@ -96,7 +96,7 @@ import { acquireDataDirLease } from "./data-dir-lease.mjs";
 import { reviveAfterFailedSwitch, switchLocalEnvironment } from "./environment-switch.mjs";
 import { createManagedDesktopClient, createManagedDesktopRelay, createManagedDesktopStore } from "./managed-desktop.mjs";
 import { CHECKOUT_SOURCES, cloudMenuSublabel, cloudTarget, createCloudAccountClient as cloudAccountClient, createCloudAccountStore } from "./cloud-account.mjs";
-import { installCloudPlanIpc } from "./cloud-plan-ipc.mjs";
+import { installCloudPlanIpc } from "./cloud-plan-ipc.mjs"; import { companyDesktopArguments as companyDesktopArgs, OPENMAUSBOT_HOSTED } from "./hosted-services.mjs";
 import { cloudLinkOpensSheet, colorDotIcons, createCloudLook, createCloudReadyNotice, installCloudBuy, lookFile } from "./cloud-buy.mjs"; import { unreadBadgeIcon } from "./color-dot.mjs";
 import { createTrialNotices } from "./cloud-trial-notice.mjs";
 import { createDesktopText, DESKTOP_PORTS, jsonFile, registerDesktopPrefs, relabelDesktop } from "./desktop-prefs.mjs"; import { CLOUD_FOCUS_WAKE_FILE, createCloudFocusWake } from "./cloud-focus-wake.mjs";
@@ -797,7 +797,7 @@ function syncPhoneSecretKey(proc) {
 const cloudEncryption = { available: async () => (await safeStorage.isAsyncEncryptionAvailable()) && (process.platform !== "linux" || safeStorage.getSelectedStorageBackend() !== "basic_text"), encrypt: value => safeStorage.encryptStringAsync(value), decrypt: value => safeStorage.decryptStringAsync(value) }; let activeSignIn = null; const cloudAccountStore = () => (activeSignIn ??= createCloudAccountStore({ file: path.join(app.getPath("userData"), cloudTarget(process.env).file), encryption: cloudEncryption }));
 function ensureCloudAccount() {
   if (cloudAccount) return cloudAccount;
-  if (!app.isPackaged || desktopRemoteAccess) throw new Error("MausBot Cloud sign-in requires the local desktop app.");
+  if (!OPENMAUSBOT_HOSTED || !app.isPackaged || desktopRemoteAccess) throw new Error(OPENMAUSBOT_HOSTED ? "MausBot Cloud sign-in requires the local desktop app." : "MausBot Cloud isn't offered in this app.");
   cloudAccount = createCloudAccountClient({
     store: cloudAccountStore(),
     platform: process.platform, deviceName: os.hostname().slice(0, 100) || "My computer", appVersion: app.getVersion(), origin: cloudTarget(process.env).origin,
@@ -833,7 +833,7 @@ async function readCloudOfferBrand() {
   refreshApplicationMenu();
 }
 function cloudOffersAllowed() {
-  return app.isPackaged && !desktopRemoteAccess && brandedBuild === false;
+  return OPENMAUSBOT_HOSTED && app.isPackaged && !desktopRemoteAccess && brandedBuild === false;
 }
 async function cloudOffersReady() {
   if (brandedBuild === null && serverReady) await readCloudOfferBrand();
@@ -1508,7 +1508,7 @@ function refreshApplicationMenu() {
       onSwitch: (id) => void workspaceMenuAction(() => switchEnvironment(id)),
       onAddFromClipboard: () => void addServerFromClipboard(),
       onConnect: () => void workspaceMenuAction(openWorkspaceSettings),
-      onOrganizationSignIn: () => queueOrganizationEntry("openmausbot://organization"),
+      ...(OPENMAUSBOT_HOSTED ? { onOrganizationSignIn: () => queueOrganizationEntry("openmausbot://organization") } : {}),
       onForget: (id) => void workspaceMenuAction(() => forgetEnvironment(id)),
       onOpenSettings: () => { if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send("app:open-settings"); },
       openAtLogin: loginItem.available() ? { checked: loginItem.chosen(), onToggle: on => { loginItem.choose(on); refreshApplicationMenu(); } } : null,
@@ -1731,7 +1731,7 @@ const organizationEntry = createOrganizationEntry({
 });
 
 function queueOrganizationEntry(link) {
-  if (!isOrganizationDeepLink(link)) return false;
+  if (!OPENMAUSBOT_HOSTED || !isOrganizationDeepLink(link)) return false;
   pendingOrganizationEntry = true;
   if (!desktopTray?.show()) activateExistingWindow(appWindows());
   void deliverOrganizationEntry();
@@ -1947,7 +1947,7 @@ function createWindow({ deferNavigation = false } = {}) {
       contextIsolation: true,
       preload: path.join(__dirname, "preload.cjs"),
       additionalArguments: [...desktopCompanionRendererArguments(rendererOrigin(), desktopRemoteAccess),
-        ...(app.isPackaged && !desktopRemoteAccess ? ["--omb-company-desktop=1"] : []), `--omb-app-version=${app.getVersion()}`, ...(linuxSoftwareRendering ? [SOFTWARE_RENDERING_ARG] : [])],
+        ...companyDesktopArgs(app.isPackaged && !desktopRemoteAccess), `--omb-app-version=${app.getVersion()}`, ...(linuxSoftwareRendering ? [SOFTWARE_RENDERING_ARG] : [])],
     },
   });
   mainWindow = win; hiddenStart = false; chromeRail.attach(win);
@@ -2600,7 +2600,7 @@ const placeInbox = createPlaceInboxWatch({ places: () => [{ id: LOCAL_ID, local:
 const localProfiles = createLocalProfiles({ registry: createProfileRegistry({ dataDir: desktopDataDir }), clean: cleanWorkspace, dataDir: desktopDataDir, allowed: () => app.isPackaged && !desktopRemoteAccess, home: () => (homeWindow.cloudOrigin() ? "cloud" : ownHome?.origin() || cleanWorkspace.marker().frozen ? null : "local"), window: { openProfile: id => homeWindow.openProfile(id), profile: () => homeWindow.profile(), showCloud: () => showHome({ place: "cloud" }) }, showLocal: () => { homeWindow.cancel(); persistEnvironments(withActive(environmentsState, LOCAL_ID)); return navigateMainWindow(rendererOrigin()); }, onLocal: () => Boolean(mainWindow && !mainWindow.isDestroyed() && senderIsLocal({ sender: mainWindow.webContents })), busy: async () => { const said = await (await localServerRequest("/api/move/freeze", { signal: AbortSignal.timeout(5_000) })).json(); return typeof said?.busy === "string" ? { name: said.busy, what: said.what } : null; }, trash: dir => shell.trashItem(dir), reserved: () => nativeT(process.platform === "darwin" ? "rail.thisMac" : "rail.thisPc"), remember: homePlaces.remember, changed: () => railChanged(), log: slog }); const railList = () => { ownHome?.refresh(); const settling = localProfiles.settling(); return railPlaces({ saved: environmentsState, waiting: placeInbox.waiting, home: homeWindow.cloudOrigin() ?? ownHome?.origin() ?? null, mine: myCloud(), state: desktopRemoteAccess ? null : cloudAccount?.state(), offers: entry => !desktopRemoteAccess && ownHome?.offers(entry) === true, accounts: accountRing.waiting(), profiles: localProfiles.places({ activeLocal: environmentsState.activeId === LOCAL_ID }), computerSettling: settling && settling.id === null ? settling.name : null, together: placesTogether.offered() && { on: placesTogether.offered().on, profile: cleanWorkspace.profile() } }); };
 // The rail as the window's own chrome (chrome-rail.mjs): this app's page beside every place's page, the one that lists.
 const placeSwitch = createPlaceSwitch({ changed: () => railChanged(), stop: () => homeWindow.stopOpening(), kept: () => homePlaces.remembered(), pageSettled: () => { const page = mainWindow && !mainWindow.isDestroyed() ? mainWindow.webContents : null; if (page?.isLoadingMainFrame()) return new Promise(done => { page.once("did-stop-loading", done); page.once("destroyed", done); }); } }); const openPlace = (id, stale) => workspaceMenuAction(async () => { if (id === LOCAL_ID) await cleanWorkspace.settled(); if (!stale()) await switchEnvironment(id, stale); }); const chromeRail = createChromeRail({ createView: options => new WebContentsView(options), preload: path.join(__dirname, "preload.cjs"), log: slog, prefs: () => desktopPrefs, changed: () => rail.changed(), openComputer: (page) => openComputerSettings({ window: () => mainWindow, onLocal: (win) => senderIsLocal({ sender: win.webContents }), showLocal: () => placeSwitch.ask(LOCAL_ID, stale => { localProfiles.cancel(); return openPlace(LOCAL_ID, stale); }) }, page),
-  args: () => [...desktopCompanionRendererArguments(rendererOrigin(), desktopRemoteAccess), ...(app.isPackaged && !desktopRemoteAccess ? ["--omb-company-desktop=1"] : []), `--omb-app-version=${app.getVersion()}`],
+  args: () => [...desktopCompanionRendererArguments(rendererOrigin(), desktopRemoteAccess), ...companyDesktopArgs(app.isPackaged && !desktopRemoteAccess), `--omb-app-version=${app.getVersion()}`],
   url: () => `${rendererOrigin()}${CHROME_RAIL_PATH}`, wanted: () => !desktopRemoteAccess && (serverReady || placeSwitch.target() !== null) && railList().length > 0 });
 chromeRail.install(ipcMain);
 function railChanged() { chromeRail.refresh(); rail.changed(); }
@@ -2669,7 +2669,7 @@ ipcMain.handle("environments:add-from-link", localWorkspaceOnly("environments:ad
 ipcMain.handle("environments:forget", localWorkspaceOnly("environments:forget", (_event, id, purge) => forgetEnvironment(typeof id === "string" ? id : "", purge === true)));
 const savedServerStatus = createServerStatus({ entries: () => environmentsState.environments.filter((e) => e.kind === "remote" && !e.home && !e.team && !e.cloud), check: (origin) => checkServer(origin, (...args) => session.defaultSession.fetch(...args)),
   appVersion: app.getVersion(), onChange: () => { if (mainWindow && !mainWindow.isDestroyed() && senderIsLocal({ sender: mainWindow.webContents })) mainWindow.webContents.send("environments:status-changed"); } });
-installServerStatus({ ipcMain, guard: localWorkspaceOnly, status: savedServerStatus, app, powerMonitor, online: () => net.isOnline() }); installUpdateAll({ ipcMain, guard: localWorkspaceOnly, servers: savedServerStatus.saved, fetch: (...args) => session.defaultSession.fetch(...args), send: (channel, view) => { if (mainWindow && !mainWindow.isDestroyed() && senderIsLocal({ sender: mainWindow.webContents })) mainWindow.webContents.send(channel, view); } }); const appInstaller = createDesktopAppInstaller({ app, shell, nativeImage, env: process.env, platform: process.platform, log: slog }); installAppInstall({ ipcMain, guard: localWorkspaceOnly, installer: appInstaller }); installLocalAppWindows({ ipcMain, guard: localOrHome, BrowserWindow, senderOrigin: (event) => { try { return new URL(event.senderFrame.url).origin; } catch { return null; } }, webPreferences: () => ({ contextIsolation: true, preload: path.join(__dirname, "preload.cjs"), additionalArguments: [...desktopCompanionRendererArguments(rendererOrigin(), desktopRemoteAccess), ...(app.isPackaged && !desktopRemoteAccess ? ["--omb-company-desktop=1"] : []), `--omb-app-version=${app.getVersion()}`, ...(linuxSoftwareRendering ? [SOFTWARE_RENDERING_ARG] : [])] }), openChat: queueChatLink, openExternal: (url) => shell.openExternal(externalLinkUrl(url)), sizes: createAppWindowSizes({ file: () => path.join(app.getPath("userData"), "app-windows.json"), log: slog }), workAreas: () => screen.getAllDisplays().map((display) => display.workArea), icon: APP_ICON, background: () => windowBackground(nativeTheme.shouldUseDarkColors), log: slog, launches: appLaunches, ready: () => app.isReady() && serverReady, launchOrigin: () => rendererOrigin(), windowDetails: (id) => appInstaller.windowDetails(id) }); for (const signal of ["resume", "unlock-screen"]) powerMonitor.on(signal, () => cloudAccount?.freshen()); // a woken computer reads its MausBot Cloud sign-in at once
+installServerStatus({ ipcMain, guard: localWorkspaceOnly, status: savedServerStatus, app, powerMonitor, online: () => net.isOnline() }); installUpdateAll({ ipcMain, guard: localWorkspaceOnly, servers: savedServerStatus.saved, fetch: (...args) => session.defaultSession.fetch(...args), send: (channel, view) => { if (mainWindow && !mainWindow.isDestroyed() && senderIsLocal({ sender: mainWindow.webContents })) mainWindow.webContents.send(channel, view); } }); const appInstaller = createDesktopAppInstaller({ app, shell, nativeImage, env: process.env, platform: process.platform, log: slog }); installAppInstall({ ipcMain, guard: localWorkspaceOnly, installer: appInstaller }); installLocalAppWindows({ ipcMain, guard: localOrHome, BrowserWindow, senderOrigin: (event) => { try { return new URL(event.senderFrame.url).origin; } catch { return null; } }, webPreferences: () => ({ contextIsolation: true, preload: path.join(__dirname, "preload.cjs"), additionalArguments: [...desktopCompanionRendererArguments(rendererOrigin(), desktopRemoteAccess), ...companyDesktopArgs(app.isPackaged && !desktopRemoteAccess), `--omb-app-version=${app.getVersion()}`, ...(linuxSoftwareRendering ? [SOFTWARE_RENDERING_ARG] : [])] }), openChat: queueChatLink, openExternal: (url) => shell.openExternal(externalLinkUrl(url)), sizes: createAppWindowSizes({ file: () => path.join(app.getPath("userData"), "app-windows.json"), log: slog }), workAreas: () => screen.getAllDisplays().map((display) => display.workArea), icon: APP_ICON, background: () => windowBackground(nativeTheme.shouldUseDarkColors), log: slog, launches: appLaunches, ready: () => app.isReady() && serverReady, launchOrigin: () => rendererOrigin(), windowDetails: (id) => appInstaller.windowDetails(id) }); for (const signal of ["resume", "unlock-screen"]) powerMonitor.on(signal, () => cloudAccount?.freshen()); // a woken computer reads its MausBot Cloud sign-in at once
 
 // A cloud page may open the native chooser, never choose a destination or edit the saved list.
 // Once My Cloud is home the switcher lists only whole places, and shows only when there is more than My Cloud.
@@ -2989,7 +2989,7 @@ app.whenReady().then(async () => { launchRecord.mark("ready");
   if (desktopShutdownStarted) return;
   if (app.isPackaged && !desktopRemoteAccess) { void ensureManagedDesktop().start().then(() => companyBackupSchedule.start()).catch(() => {}); void managedDesktop.whenRestored().then(() => tailnetShare.recheck()); }
   // Fresh local use never makes a Cloud request; start only restores an existing grant.
-  if (app.isPackaged && !desktopRemoteAccess) {
+  if (OPENMAUSBOT_HOSTED && app.isPackaged && !desktopRemoteAccess) {
     cloudAccountRestoring = true;
     cloudAccountStarted = ensureCloudAccount().start().catch(() => {}).then(() => accountRing()?.start()).finally(() => { cloudAccountRestoring = false; });
   }

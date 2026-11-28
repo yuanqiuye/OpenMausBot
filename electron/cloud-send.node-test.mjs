@@ -235,7 +235,7 @@ test("cloud-send:teams returns empty teams outside My Cloud without throwing", a
 function preload({ remote = false, activation = false } = {}) {
   let bridge; const invoked = [];
   vm.runInNewContext(readFileSync(new URL("./preload.cjs", import.meta.url), "utf8"), {
-    process: { platform: "darwin", argv: [`--omb-local-origin=${LOCAL}`, "--omb-company-desktop=1"] },
+    process: { platform: "darwin", argv: [`--omb-local-origin=${LOCAL}`, "--omb-company-desktop=1", "--omb-hosted-services=1"] },
     location: { origin: remote ? CLOUD : LOCAL }, navigator: { userActivation: { isActive: activation } },
     TextEncoder, localStorage: { getItem: () => null },
     require: () => ({ webUtils: {}, contextBridge: { exposeInMainWorld: (_name, value) => { bridge = value; } },

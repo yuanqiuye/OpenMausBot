@@ -450,7 +450,7 @@ const PRELOAD = readFileSync(new URL("./preload.cjs", import.meta.url), "utf8");
 function preload(origin, { home = false, activation = false, pairedElsewhere = false } = {}) {
   let bridge; const invoked = [], synced = [], listeners = new Map();
   vm.runInNewContext(PRELOAD, {
-    process: { platform: "darwin", argv: [`--omb-local-origin=${LOCAL}`, ...(pairedElsewhere ? ["--openmausbot-remote-client"] : ["--omb-company-desktop=1"])] },
+    process: { platform: "darwin", argv: [`--omb-local-origin=${LOCAL}`, ...(pairedElsewhere ? ["--openmausbot-remote-client"] : ["--omb-company-desktop=1", "--omb-hosted-services=1"])] },
     location: { origin }, navigator: { userActivation: { isActive: activation } }, TextEncoder, localStorage: { getItem: () => null },
     queueMicrotask,
     require: () => ({ webUtils: {}, contextBridge: { exposeInMainWorld: (_name, value) => { bridge = value; } },

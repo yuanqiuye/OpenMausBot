@@ -30,6 +30,7 @@ import { PlaceBadge } from "../SettingsNav";
 import { SettingsSkeletonCard } from "../SettingsStates";
 import { devicesPlaceKey, setDevicesSignal } from "../devices-signal";
 import { useSettingsShell } from "../settings-shell";
+import { OPENMAUSBOT_HOSTED } from "../../../../electron/hosted-services.mjs";
 
 /** Tailscale's download page for this computer's system. */
 export function tailscaleDownload(platform: string | undefined): string {
@@ -57,9 +58,10 @@ const TAILSCALE_ADMIN = "https://login.tailscale.com/admin/machines";
 /** A recheck when the person comes back to the window: at most this often, and only after they asked once here. */
 const RECHECK_MS = 5_000;
 
-const ADD_LABEL: Record<DeviceGroup, Parameters<typeof t>[0]> = { phones: "devicesPage.addGroup.phone", computers: "devicesPage.addGroup.computer", servers: "devicesPage.addGroup.cloudOrServer" };
+const ADD_LABEL: Record<DeviceGroup, Parameters<typeof t>[0]> = { phones: "devicesPage.addGroup.phone", computers: "devicesPage.addGroup.computer",
+  servers: OPENMAUSBOT_HOSTED ? "devicesPage.addGroup.cloudOrServer" : "devicesPage.addGroup.server" };
 /** Each group's Add opens its own steps; Clouds and your own servers opens the choice, which has both. */
-const ADD_KIND: Record<DeviceGroup, AddKind | null> = { phones: "phone", computers: "computer", servers: null };
+const ADD_KIND: Record<DeviceGroup, AddKind | null> = { phones: "phone", computers: "computer", servers: OPENMAUSBOT_HOSTED ? null : "server" };
 const PHONES_ADD = "[data-add-group=phones]";
 
 const NO_PHONES: readonly string[] = [];
@@ -285,7 +287,7 @@ export function DevicesPage() {
       tailnetAddress={companion?.tailnetShare?.origin ?? null} start={adding.start} viaKeys={adding.keys} onBack={leave} onConnected={refresh}
       phoneSteps={phoneSteps} advanced={ctx.advanced} setSub={setSub}
       canConnectServer={Boolean(workspaces?.add)} onCheck={() => void check()} checking={c.busy}
-      onGetCloud={workspaces?.add ? () => { setAdding(null); dispatch({ type: "toggleAppSettings", open: false }); void workspaces.add?.("cloud"); } : null} />;
+      onGetCloud={OPENMAUSBOT_HOSTED && workspaces?.add ? () => { setAdding(null); dispatch({ type: "toggleAppSettings", open: false }); void workspaces.add?.("cloud"); } : null} />;
   }
 
   const here = devices.find((device) => device.here)!;

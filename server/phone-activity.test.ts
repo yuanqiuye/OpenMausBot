@@ -7,7 +7,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { resolveApnsConfig } from "./apns-config.ts";
 import { ApnsDirectClient, type ApnsRawRequest } from "./apns-direct.ts";
 import { activityRegistrationSchema, FALLBACK_VISUAL, PhoneActivity } from "./phone-activity.ts";
-import { PhonePush, PUSH_DEVICE_LOW_MAX } from "./phone-push.ts";
+import { PhonePush } from "./phone-push.ts";
 
 const CREDENTIAL = `omb_install_${"a".repeat(22)}.${"b".repeat(43)}`;
 const START = "5a".repeat(40);
@@ -182,13 +182,12 @@ describe("pushing a bot's activity while the app is closed", () => {
     expect(activityCalls().map((body) => body.event)).toEqual(["end"]);
   });
 
-  it("counts its pushes against the phone's hourly cap, at the lower priority, leaving the rest for its alerts", async () => {
+  it("sends every change, however many: no hourly cap holds them back", async () => {
     const { push, activity, activityCalls, calls, step } = harness();
     await push.register(ANDROID, { platform: "fcm", token: FCM });
     await activity.register(ANDROID, registration({ ongoing: true }));
-    for (let change = 0; change < PUSH_DEVICE_LOW_MAX + 5; change += 1) await step({ busy: change % 2 === 0 }, runtime(change % 2 === 0 ? "turn.started" : "turn.completed"));
-    expect(activityCalls()).toHaveLength(PUSH_DEVICE_LOW_MAX);
-    // An approval still reaches the phone.
+    for (let change = 0; change < 100; change += 1) await step({ busy: change % 2 === 0 }, runtime(change % 2 === 0 ? "turn.started" : "turn.completed"));
+    expect(activityCalls()).toHaveLength(100);
     push.offer({ notification: { kind: "approval", botId: "bot_1", botName: "Scout", threadId: "th_1" }, seq: 1 }, everyone);
     await push.flush();
     expect(calls.filter((call) => call.path.endsWith("/push/send"))).toHaveLength(1);

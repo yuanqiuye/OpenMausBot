@@ -960,9 +960,8 @@ export class PhoneActivity {
   }
 
   private async post(key: string, botId: string, body: DirectApnsActivityRequest | PushRelayActivityRequest, via: "apns" | "fcm"): Promise<ActivityOutcome> {
-    const answer = await this.options.push.callFor(key, PHONE_ACTIVITY_RELAY_PATH, body);
+    const answer = await this.options.push.call(PHONE_ACTIVITY_RELAY_PATH, body, key);
     const base = { key, botId, event: body.event, via } as const;
-    if (answer === "capped") return { ...base, result: "dropped" };
     if (answer && answer.status < 300) return { ...base, result: "sent" };
     if (answer && (answer.status === 410 || answer.code === PUSH_RELAY_ERRORS.unregistered || answer.code === PUSH_RELAY_ERRORS.unknownDevice)) {
       if (via === "apns") {

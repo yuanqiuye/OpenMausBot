@@ -49,7 +49,7 @@ function mainRule() {
   const context = vm.createContext({
     ipcMain: { handle: () => {}, on: (channel, listener) => listeners.set(channel, listener) },
     senderIsLocal: localOriginModule.isLocalSender, workspaceSenderAllowed: environments.workspaceSenderAllowed, cloudPageSenderAllowed, myCloudOrigin, otherOwnClouds,
-    activeEnvironment: environments.activeEnvironment, rendererOrigin: () => LOCAL, desktopRemoteAccess: false,
+    activeEnvironment: environments.activeEnvironment, rendererOrigin: () => LOCAL, desktopRemoteAccess: false, OPENMAUSBOT_HOSTED: true,
     mainWindow: window,
     environmentsState: { environments: [], activeId: environments.LOCAL_ID },
     cloudAccount: { homeTarget: () => ({ origin: CLOUD }), state: () => ({ status: "connected", account: { id: "a1" } }), isOwnCloud: () => false },

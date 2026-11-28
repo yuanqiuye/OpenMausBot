@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+vi.mock("../../electron/hosted-services.mjs", async (original) => ({ ...(await original<object>()), OPENMAUSBOT_HOSTED: true }));
 
 import { analyticsEnabled, initAnalytics, optAction, setAnalyticsEnabled } from "./analytics";
 import { appVersion } from "./app-links";

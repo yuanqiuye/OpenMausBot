@@ -14,6 +14,7 @@ import {
   type AnnouncementPlan, type AnnouncementPlatform, type AnnouncementSurface,
 } from "../../shared/announcements";
 import { parseRelease, type ReleaseEntry } from "../../shared/release-notes";
+import { OPENMAUSBOT_HOSTED } from "../../electron/hosted-services.mjs";
 
 /** Sponsor cards (the announcements' and the app's own) for a Team Cloud's members who are not its owner or an admin. Off:
  * a sponsor's card is for whoever chooses the team's providers. The owner's call; flip this to show them to every member. */
@@ -248,6 +249,8 @@ export interface PickContext {
   admin: boolean;
 }
 
+const opensMyCloud = (card: AnnouncementCard): boolean => !OPENMAUSBOT_HOSTED && cardPlaces(card).includes("my_cloud");
+
 /** The first card in file order that is due, "wait" while a fact the first candidate needs is still loading, or null. */
 export function pickAnnouncement(list: readonly AnnouncementCard[], context: PickContext): AnnouncementCard | "wait" | null {
   if (context.branded) return null;
@@ -259,6 +262,7 @@ export function pickAnnouncement(list: readonly AnnouncementCard[], context: Pic
     if (cardSeen(context.seen, card.id) || (launch !== null && launch !== card.id)) continue;
     if (card.kind === "sponsor" && (!context.sponsors || (!rested && launch !== card.id))) continue;
     if (!context.admin && cardPlaces(card).some((place) => ADMIN_PLACES.has(place))) continue;
+    if (opensMyCloud(card)) continue;
     const matches = audienceMatches(card.audience, context.facts);
     if (matches === null) return "wait";
     if (matches) return card;
@@ -272,7 +276,7 @@ export function cardsForPerson(list: readonly AnnouncementCard[], context: Omit<
   const now = context.facts.nowMs;
   return list.filter((card) => !(card.starts && Date.parse(card.starts) > now) && Date.parse(card.ends) > now
     && (card.kind !== "sponsor" || context.sponsors) && (context.admin || !cardPlaces(card).some((place) => ADMIN_PLACES.has(place)))
-    && audienceMatches(card.audience, context.facts) === true);
+    && !opensMyCloud(card) && audienceMatches(card.audience, context.facts) === true);
 }
 
 export type AnnouncementAction = "shown" | "primary" | "secondary" | "close";

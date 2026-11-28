@@ -114,9 +114,10 @@ export interface DevsReportsDeps {
   recentLog: RecentLog;
   /** Timing lines for these conversations and bots: numbers, fixed codes and opaque ids only. */
   performance?(filter: { threadIds: readonly string[]; botIds: readonly string[] }): string[];
-  send(payload: DevsReportPayload): Promise<SendOutcome>;
+  /** Null where this build has nowhere to send reports: a @devs line is then an ordinary mention. */
+  send: ((payload: DevsReportPayload) => Promise<SendOutcome>) | null;
   /** Asks the MausBot team about reports this app sent (devs-report-send.ts `askReportStatus`); null: no answer this time. */
-  askStatus(question: ReportStatusQuestion): Promise<ReportStatusAnswer | null>;
+  askStatus: ((question: ReportStatusQuestion) => Promise<ReportStatusAnswer | null>) | null;
   /** One notification about a line in this conversation; `person`, on a Team Cloud, the only one it reaches. */
   tell(threadId: string, text: string, person?: string): void;
   /** How often to ask about open reports (tests and fixtures; STATUS_EVERY_MS otherwise). */
@@ -298,7 +299,7 @@ export function createDevsReports(deps: DevsReportsDeps) {
     for (const [installId, entries] of byInstall) {
       for (let from = 0; from < entries.length; from += BUG_REPORT_STATUS_MAX_IDS) {
         const batch = entries.slice(from, from + BUG_REPORT_STATUS_MAX_IDS);
-        const answer = await deps.askStatus({ installId, ids: batch.map((entry) => entry.reportId) }).catch(() => null);
+        const answer = await deps.askStatus?.({ installId, ids: batch.map((entry) => entry.reportId) }).catch(() => null);
         if (!answer) return;
         for (const said of answer.reports) {
           const entry = batch.find((one) => one.reportId === said.id);
@@ -378,12 +379,17 @@ export function createDevsReports(deps: DevsReportsDeps) {
     return { ok: false, line: notYetLine(outcome, language), marker: FAILED_MARKER };
   }
 
+  function sendReport(payload: DevsReportPayload): Promise<SendOutcome> {
+    if (!deps.send) return Promise.resolve({ ok: false, retry: false, why: "refused", detail: "this build sends no bug reports" });
+    return deps.send(payload).catch((): SendOutcome => ({ ok: false, retry: true, why: "offline" }));
+  }
+
   function deliver(entry: Waiting, author: Author): Promise<Told> {
     const running = inFlight.get(entry.messageId);
     if (running) return running;
     const attempt = (async () => {
       const { payload, contact } = build(entry, author);
-      const outcome = await deps.send(payload).catch((): SendOutcome => ({ ok: false, retry: true, why: "offline" }));
+      const outcome = await sendReport(payload);
       waiting = waiting.filter((one) => one.messageId !== entry.messageId);
       const said = settle(entry, payload, outcome, contact);
       save();
@@ -406,7 +412,7 @@ export function createDevsReports(deps: DevsReportsDeps) {
 
   async function retry(queued: Queued): Promise<void> {
     retrying.add(queued);
-    const outcome = await deps.send(queued.payload).catch((): SendOutcome => ({ ok: false, retry: true, why: "offline" })).finally(() => retrying.delete(queued));
+    const outcome = await sendReport(queued.payload).finally(() => retrying.delete(queued));
     const contact = queued.payload.contactEmail ?? queued.payload.contact, language = languageFor(queued.person);
     if (outcome.ok) {
       outbox = outbox.filter((one) => one !== queued);
@@ -470,7 +476,7 @@ export function createDevsReports(deps: DevsReportsDeps) {
   }
 
   function personWrote(threadId: string, line: Message): void {
-    if (seen.has(line.id) || !line.text || now() - line.at > FRESH_MS) return;
+    if (!deps.send || seen.has(line.id) || !line.text || now() - line.at > FRESH_MS) return;
     if (!line.sendId && deps.automated(threadId)) return;
     const typed = ownWords(withoutPastes(line.text));
     if (!typed.some((part) => tagsDevs(part))) return;
@@ -499,7 +505,7 @@ export function createDevsReports(deps: DevsReportsDeps) {
     }
   });
   // A waiting @devs line polls whether its turn is still running; otherwise nothing is due before a retry or a status ask.
-  const timer = deps.timer === false ? null : startDueTimer({ run: tick, now, retryMs: TICK_MS,
+  const timer = deps.timer === false || !deps.send ? null : startDueTimer({ run: tick, now, retryMs: TICK_MS,
     next: () => waiting.length || told.length ? now() : Math.min(nextAskAt, ...outbox.map((queued) => queued.nextAt)) });
 
   return {

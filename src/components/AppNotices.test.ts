@@ -104,7 +104,7 @@ function windowOn(origin: string, { click = true } = {}) {
   const page: Page = origin === LOCAL_ORIGIN ? "local" : origin === MY_CLOUD ? "cloud" : "server";
   let ogb: Record<string, unknown> = {};
   vm.runInNewContext(PRELOAD, {
-    process: { platform: "darwin", argv: [`--omb-local-origin=${LOCAL_ORIGIN}`, "--omb-company-desktop=1"] },
+    process: { platform: "darwin", argv: [`--omb-local-origin=${LOCAL_ORIGIN}`, "--omb-company-desktop=1", "--omb-hosted-services=1"] },
     location: { origin }, navigator: { userActivation: { isActive: click } }, TextEncoder,
     require: () => ({ webUtils: {}, contextBridge: { exposeInMainWorld: (_name: string, value: Record<string, unknown>) => { ogb = value; } },
       ipcRenderer: { on() {}, removeListener() {}, send() {},

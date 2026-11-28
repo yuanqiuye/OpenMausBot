@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 
 import { ControlPlaneError } from "./control-plane-client.mjs";
 import {
+  DEFAULT_COMPANION_CONTROL_PLANE_URL,
   COMPANION_ACCOUNT_CLEANUP_PENDING_FIELD,
   COMPANION_ACCOUNT_EMAIL_FIELD,
   COMPANION_ACCOUNT_TOKEN_FIELD,
@@ -115,7 +116,7 @@ function signedCredentials(overrides = {}) {
 describe("Companion account service", () => {
   it("uses the packaged hosted default and only explicit safe development origins", () => {
     expect(resolveCompanionControlPlaneURL({ isPackaged: true, environment: {} })).toBe(
-      "https://accounts.openmausbot.com",
+      DEFAULT_COMPANION_CONTROL_PLANE_URL,
     );
     expect(resolveCompanionControlPlaneURL({
       isPackaged: false,

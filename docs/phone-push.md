@@ -219,12 +219,9 @@ phone then still gets "Scout finished" from that computer; a tap opens
 nothing, because the computer is no longer saved.
 
 **Rate limits.** On the server: one push per phone, kind and conversation in
-10 seconds, and 60 pushes per phone an hour, alerts and Live Activity changes
-together, the same as the control plane allows a token. Finished replies and
-activity changes stop at 40 in that hour, so a bot looping finished replies
-leaves the last 20 for approvals, questions and sign-ins. When the relay answers
-`429`, only that phone is left alone for the wait it names (a minute) and only
-its waiting pushes are dropped; every other phone's go on. In the control
+10 seconds, and no hourly cap per phone. When APNs or the relay answers `429`,
+that one push is retried like a network failure (after 5 s, 30 s and 2 min); no
+phone is held back. In the control
 plane: 600 sends per installation and 60 per token per hour, 120 registrations
 per hour, 50 tokens per installation. A Cloud home gets 200 sends an hour (1% of
 the fleet's), 60 per token, 120 registrations and 50 tokens, and every Cloud

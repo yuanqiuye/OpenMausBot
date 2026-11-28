@@ -100,6 +100,11 @@ describe("buildApplicationMenu", () => {
     expect(onOrganizationSignIn).toHaveBeenCalledOnce();
   });
 
+  it("leaves organisation sign-in out when main offers none", () => {
+    const submenu = build("darwin").find(entry => entry.label === "Server").submenu;
+    expect(submenu.some(entry => entry.id === "organization-sign-in")).toBe(false);
+  });
+
   it("mirrors Add a Cloud… under the saved servers only when main offers it, and names My Cloud's line", () => {
     const servers = [{ id: "cloud", name: "My Cloud", origin: "https://omb-u-1.fly.dev" }];
     const without = build("darwin", { environments: servers }).find(entry => entry.label === "Server").submenu;

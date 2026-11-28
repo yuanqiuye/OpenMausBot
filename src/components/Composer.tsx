@@ -104,6 +104,7 @@ import {
 import { useSlashSkills } from "@/lib/use-slash-skills";
 import { randomUuid } from "@/lib/random-uuid";
 import { useComposerThreadCommand } from "./use-composer-thread-command";
+import { OPENMAUSBOT_HOSTED } from "../../electron/hosted-services.mjs";
 
 const supportsAgents = (instances: InstanceInfo[], candidate?: Bot) =>
   Boolean(candidate && instances.find((instance) => instance.instanceId === candidate.modelSelection.instanceId)?.capabilities?.agentsMcp);
@@ -361,7 +362,7 @@ export function Composer({
       : bots
           .filter((member) => member.id !== bot?.id && !member.hidden && !isPlaceId(member.id) && !hiddenFromSidebar(member, viewer))
           .map((member) => ({ id: member.id, name: member.name, bot: member }));
-    return mentionChoicesForQuery([...pool, ...teammateChoices(teammates.people), DEVS_CHOICE], mention.query);
+    return mentionChoicesForQuery([...pool, ...teammateChoices(teammates.people), ...(OPENMAUSBOT_HOSTED ? [DEVS_CHOICE] : [])], mention.query);
   }, [mention, dismissedAt, bots, bot?.id, group, members, teammates, viewer]);
   const mentionEveryoneCount = (members ?? []).filter((member) => !member.hidden).length;
   const mentionPickerOpen = candidates.length > 0;

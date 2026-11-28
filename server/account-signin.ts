@@ -1,7 +1,7 @@
 // Email sign-in through the OpenMausBot control plane, or through the server's own mail server when OMB_SIGNIN_SMTP_URL is
 // set: the code exchange is server-side, so a browser only talks to this server, and a server with an empty allow-list
 // does not expose the routes. The result is an ordinary local session.
-import { resolveCompanionControlPlaneURL } from "../electron/companion-account-service.mjs";
+import { controlPlaneMissingReason, resolveCompanionControlPlaneURL } from "../electron/companion-account-service.mjs";
 import { ControlPlaneError, createControlPlaneClient, normalizeAccountEmail, type ControlPlaneClient } from "../electron/control-plane-client.mjs";
 import type { Scope } from "./sessions.ts";
 import { createSignInMail, SignInMailError, type MailTransport, type SignInMail } from "./sign-in-mail.ts";
@@ -63,7 +63,7 @@ export function createEmailSignIn(options: {
   const controlPlane = (): ControlPlaneClient => {
     if (client) return client;
     const url = resolveCompanionControlPlaneURL({ isPackaged: true, environment: env });
-    if (!url) throw new Error("OMB_CONTROL_PLANE_URL is set but is not an https address");
+    if (!url) throw new Error(controlPlaneMissingReason(env));
     client = createControlPlaneClient({ baseURL: url, fetchImpl: options.fetchImpl });
     return client;
   };

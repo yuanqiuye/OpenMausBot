@@ -2,14 +2,14 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { createLaunchAnalytics, launchAnalyticsAllowed } from "./launch-analytics.mjs";
 
-const ON = { packaged: true, env: {} };
+const ON = { packaged: true, env: {}, hosted: true };
 
-function launch({ choice = null, lastVersion = null, version = "0.1.170", packaged = true, env = {}, platform = "darwin" } = {}) {
+function launch({ choice = null, lastVersion = null, version = "0.1.170", packaged = true, env = {}, platform = "darwin", hosted = true } = {}) {
   const sent = [];
   let clock = 1_000;
   const analytics = createLaunchAnalytics({
     fetch: async (url, init) => { sent.push({ url, init, body: JSON.parse(init.body) }); return { ok: true }; },
-    choice: () => choice, lastVersion, version, platform, packaged, env, now: () => clock, id: "launch-id",
+    choice: () => choice, lastVersion, version, platform, packaged, env, hosted, now: () => clock, id: "launch-id",
   });
   return { analytics, sent, tick: (ms) => { clock += ms; } };
 }
@@ -52,7 +52,7 @@ test("a failed server says why in a word from its list, and a main-window crash 
 });
 
 test("nothing is sent with the switch off, in development, under the smoke tests or in CI", () => {
-  for (const options of [{ choice: false }, { packaged: false }, { env: { OMB_SMOKE_TEST: "1" } }, { env: { CI: "true" } }]) {
+  for (const options of [{ choice: false }, { packaged: false }, { env: { OMB_SMOKE_TEST: "1" } }, { env: { CI: "true" } }, { choice: true, hosted: false }]) {
     const { analytics, sent } = launch(options);
     analytics.stage("started");
     analytics.stage("server_failed");
@@ -72,7 +72,7 @@ test("with no choice kept, only a first launch or one after a version that kept 
 
 test("a send that throws or rejects never reaches the launch", async () => {
   for (const fetch of [() => { throw new Error("offline"); }, async () => { throw new Error("offline"); }]) {
-    const analytics = createLaunchAnalytics({ fetch, choice: () => true, lastVersion: null, version: "1.0.0", platform: "win32", packaged: true, env: {} });
+    const analytics = createLaunchAnalytics({ fetch, choice: () => true, lastVersion: null, version: "1.0.0", platform: "win32", packaged: true, env: {}, hosted: true });
     assert.doesNotThrow(() => analytics.stage("started"));
   }
   await new Promise((resolve) => setImmediate(resolve));

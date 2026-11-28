@@ -25,7 +25,9 @@ function fixture(options: { dataDir?: string; sections?: string[]; outcomes?: Se
   /** The conversations, kept across a restart (another fixture on the same data). */
   threads?: Map<string, Message[]>;
   /** The MausBot team's answer to each question about this app's reports; none: no answer (offline). */
-  answer?: (question: ReportStatusQuestion) => ReportStatusAnswer | null } = {}) {
+  answer?: (question: ReportStatusQuestion) => ReportStatusAnswer | null;
+  /** This build has nowhere to send reports. */
+  nowhere?: boolean } = {}) {
   const dataDir = options.dataDir ?? mkdtempSync(join(tmpdir(), "omb-devs-reports-"));
   if (!options.dataDir) dirs.push(dataDir);
   const listeners = new Set<(change: StoreChange) => void>();
@@ -68,8 +70,8 @@ function fixture(options: { dataDir?: string; sections?: string[]; outcomes?: Se
     appsReady: () => false, sessions: () => options.sessions ?? [], ownerKey: options.ownerKey ?? null, team: options.team === true,
     profileEmail: () => options.profileEmail, language: () => "en", ...(options.lineLanguage ? { lineLanguage: options.lineLanguage } : {}),
     recentLog: () => ["2026-10-27T08:59:00.000Z warn engine probe slow"],
-    send: async (payload) => { sent.push(payload); return outcomes.shift() ?? { ok: true, id: `report-${sent.length}` }; },
-    askStatus: async (question) => { asked.push(question); return options.answer?.(question) ?? null; },
+    send: options.nowhere ? null : async (payload) => { sent.push(payload); return outcomes.shift() ?? { ok: true, id: `report-${sent.length}` }; },
+    askStatus: options.nowhere ? null : async (question) => { asked.push(question); return options.answer?.(question) ?? null; },
     tell: (threadId, text, person) => { told.push({ threadId, text, ...(person ? { person } : {}) }); },
     now: () => clock, timer: false,
   };
@@ -128,6 +130,24 @@ describe("a message that tags @devs", () => {
     expect(fx.notices("scout-main").filter((name) => name.startsWith("notice:"))).toEqual([]);
     expect(fx.reports.note("scout-main", true)).toBe("");
     expect((await fx.call("scout", "scout-main", { went_wrong: "again" })).body.text).toMatch(/^Already sent as report report-1/);
+    fx.stop();
+  });
+
+  it("is an ordinary mention where this build has nowhere to send reports: nothing waits, no note, no line", async () => {
+    const fx = fixture({ nowhere: true });
+    fx.person("scout-main", "@devs the send button froze");
+    fx.busy.add("scout-main");
+    expect(fx.reports.note("scout-main", true)).toBe("");
+    fx.bot("scout-main", "Sorry about that.", { turnId: "t1", turnSucceeded: true });
+    fx.busy.delete("scout-main");
+    await fx.settle();
+    fx.advance(LONGEST_WAIT_MS * 2);
+    await fx.settle();
+    expect(fx.sent).toEqual([]);
+    expect(fx.asked).toEqual([]);
+    expect(fx.notices("scout-main")).toEqual([]);
+    expect(JSON.stringify((await fx.call("scout", "scout-main", { went_wrong: "it froze" })).body)).not.toContain("Sent.");
+    expect(fx.sent).toEqual([]);
     fx.stop();
   });
 

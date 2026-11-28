@@ -4,6 +4,7 @@ import { t } from "@/lib/i18n";
 import { lastSeen } from "@/lib/pairing-time";
 import type { Device, DeviceGroup, DeviceKind, DeviceRoute, PrivateNetwork, PrivateNetworkState } from "@/lib/devices";
 import { productName } from "@/lib/brand";
+import { OPENMAUSBOT_HOSTED } from "../../../electron/hosted-services.mjs";
 
 export const KIND_ICON: Record<DeviceKind, LucideIcon> = { laptop: Laptop, desktop: Monitor, server: Server, cloud: Cloud, phone: Smartphone, vm: Box };
 
@@ -27,7 +28,7 @@ const ROUTE_INLINE: Partial<Record<DeviceRoute, LocaleKey>> = {
 export const routeList = (routes: readonly DeviceRoute[]): string =>
   routes.map((route, index) => (index > 0 && ROUTE_INLINE[route] ? t(ROUTE_INLINE[route], { app: productName() }) : routeLabel(route))).join(", ");
 
-const GROUP: Record<DeviceGroup, LocaleKey> = { computers: "devicesPage.group.computers", servers: "devicesPage.group.servers", phones: "devicesPage.group.phonesTablets" };
+const GROUP: Record<DeviceGroup, LocaleKey> = { computers: "devicesPage.group.computers", servers: OPENMAUSBOT_HOSTED ? "devicesPage.group.servers" : "settings.desktops.servers", phones: "devicesPage.group.phonesTablets" };
 export const groupLabel = (group: DeviceGroup): string => t(GROUP[group]);
 
 /** One short line: how it is, or the one thing it needs. */

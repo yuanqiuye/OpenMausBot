@@ -5,8 +5,9 @@ import test from "node:test";
 
 // Node tests run without Electron: satisfy preload's require("electron") from the require cache; the real preload still runs.
 const require = createRequire(import.meta.url);
-// The company desktop's keys are part of the bridge too: the test looks at the whole of it.
-process.argv.push("--omb-company-desktop=1");
+// The company desktop's keys, and the hosted services' (electron/hosted-services.mjs), are part of the bridge too: the
+// test looks at the whole of it.
+process.argv.push("--omb-company-desktop=1", "--omb-hosted-services=1");
 const exposed = { api: null };
 const fakeElectron = {
   ipcRenderer: { on: () => undefined, removeListener: () => undefined, invoke: async () => undefined, send: () => undefined },

@@ -179,7 +179,7 @@ describe("the Devices page", () => {
     await render();
     expect($("[data-device-node=here]")?.textContent).toContain("This computer");
     expect([...document.querySelectorAll("section:is([data-settings-block=phones], [data-settings-block^=group-]) > div h3")].map((heading) => heading.textContent))
-      .toEqual(["Phones and tablets", "Computers", "Clouds and your own servers"]);
+      .toEqual(["Phones and tablets", "Computers", "Your own servers"]);
     const iphone = $("[data-device-row='phone:iphone']")!;
     expect(iphone.getAttribute("data-device-status")).toBe("online");
     expect(iphone.querySelector("[data-device-state]")?.getAttribute("data-device-state")).toBe("online");
@@ -386,7 +386,7 @@ describe("the Devices page", () => {
     companion = { ...companion, devices: [], connectedDeviceIds: [] };
     await render();
     expect([...document.querySelectorAll("[data-add-empty]")].map((one) => [one.getAttribute("data-add-empty"), one.textContent]))
-      .toEqual([["phones", "Add a phone"], ["computers", "Add a computer"], ["servers", "Add a Cloud or own server"]]);
+      .toEqual([["phones", "Add a phone"], ["computers", "Add a computer"], ["servers", "Add your own server"]]);
     expect($("[data-add-empty=computers]")?.closest("[data-settings-empty]")?.querySelector("[data-devices-empty=computers]")).not.toBeNull();
     expect(document.querySelectorAll("[data-add-group=computers]")).toHaveLength(1);
     expect($("[data-add-empty=computers]")?.className).toContain("settings-quiet");
@@ -485,14 +485,14 @@ describe("Add a device, in the page", () => {
     await render();
     expect($("[data-settings-block=add] [data-add-device]")).not.toBeNull();
     expect($("[data-settings-block=here] [data-add-device]"), "You're here has no Add of its own").toBeNull();
-    for (const [opener, step] of [["[data-add-device]", "choose"], ["[data-add-group=phones]", "phone"], ["[data-add-group=computers]", "computer"], ["[data-add-group=servers]", "choose"]] as const) {
+    for (const [opener, step] of [["[data-add-device]", "choose"], ["[data-add-group=phones]", "phone"], ["[data-add-group=computers]", "computer"], ["[data-add-group=servers]", "server"]] as const) {
       await click(opener);
       expect($("[data-add-panel]")?.getAttribute("data-add-step")).toBe(step);
       expect(layers()).toBe(0);
       await click("[data-add-back]");
       expect($("[data-add-panel]")).toBeNull();
     }
-    for (const kind of ["phone", "computer", "server", "cloud"]) {
+    for (const kind of ["phone", "computer", "server"]) {
       await click("[data-add-device]");
       await click(`[data-add-kind=${kind}]`);
       expect($("[data-add-panel]")?.getAttribute("data-add-step")).toBe(kind);
@@ -722,14 +722,11 @@ describe("Add a device, in the page", () => {
     expect($("[data-add-connected='place:nuc']")?.textContent).toContain("Garage NUC is connected");
   });
 
-  it("gets a Cloud by closing Settings for the plans, the one place this page hands over to something else", async () => {
+  it("offers no Cloud to get where this build offers none", async () => {
     await render();
     await click("[data-add-device]");
-    await click("[data-add-kind=cloud]");
+    expect($("[data-add-kind=cloud]")).toBeNull();
     expect(workspaces.add).not.toHaveBeenCalled();
-    await click("[data-get-cloud]");
-    expect(dispatch).toHaveBeenCalledWith({ type: "toggleAppSettings", open: false });
-    expect(workspaces.add).toHaveBeenCalledWith("cloud");
   });
 
   it("offers a chat-only session no code at all", async () => {
@@ -1350,7 +1347,7 @@ describe("the map above the list", () => {
     await render();
     expect($("[data-settings-block=here] h3")).toBeNull();
     expect($("[data-map-legend]")?.textContent).toBe("Solid: connected now · Dashed: away");
-    expect([...document.querySelectorAll("[data-map-group] > span[id]")].map((label) => label.textContent)).toEqual(["Phones", "Clouds and servers"]);
+    expect([...document.querySelectorAll("[data-map-group] > span[id]")].map((label) => label.textContent)).toEqual(["Phones", "Servers"]);
     expect($("[data-map-node='place:vps'] .truncate")).toBeNull();
   });
 

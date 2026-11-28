@@ -7,6 +7,7 @@ import type { LocaleKey } from "@/locales";
 import { networkMark } from "./DeviceRows";
 import { BotFaces, botsLabel, markOf, routeOf, StatusMark, useBotsOn } from "./device-parts";
 import { kindLabel, networkShort, statusText } from "./device-words";
+import { OPENMAUSBOT_HOSTED } from "../../../electron/hosted-services.mjs";
 
 /** The picture of this place's devices above the list. Flip to false to ship the page without it. */
 export const SHOW_DEVICE_MAP = true;
@@ -21,7 +22,7 @@ export const deviceMapShown = () => shownOverride ?? SHOW_DEVICE_MAP;
 const LINE = "border-ink-secondary/35";
 const away = (devices: readonly Device[]) => devices.length > 0 && devices.every((device) => device.status === "offline");
 
-const GROUP: Record<DeviceGroup, LocaleKey> = { phones: "devicesPage.group.phones", computers: "devicesPage.group.computers", servers: "devicesPage.map.servers" };
+const GROUP: Record<DeviceGroup, LocaleKey> = { phones: "devicesPage.group.phones", computers: "devicesPage.group.computers", servers: OPENMAUSBOT_HOSTED ? "devicesPage.map.servers" : "sidebar.servers" };
 const COUNT: Record<DeviceGroup, [LocaleKey, LocaleKey]> = {
   phones: ["devicesPage.map.phonesOne", "devicesPage.map.phonesMany"],
   computers: ["devicesPage.map.computersOne", "devicesPage.map.computersMany"],

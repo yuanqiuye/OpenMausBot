@@ -4,6 +4,7 @@ import { createElement } from "react";
 import { flushSync } from "react-dom";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+vi.mock("../../../electron/hosted-services.mjs", async (original) => ({ ...(await original<object>()), OPENMAUSBOT_HOSTED: true }));
 import { setLocale } from "@/lib/i18n";
 import type { AppSettingsSection } from "@/state/store";
 

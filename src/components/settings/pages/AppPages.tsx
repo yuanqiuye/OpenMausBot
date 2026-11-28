@@ -4,6 +4,7 @@ import { productName } from "@/lib/brand";
 import { FEEDBACK_URL, HELP_CENTER_URL, desktopAppVersion, openExternalLink } from "@/lib/app-links";
 import { t } from "@/lib/i18n";
 import { useStoreDispatch } from "@/state/store-select";
+import { OPENMAUSBOT_HOSTED } from "../../../../electron/hosted-services.mjs";
 import { AboutDialog } from "../../AboutDialog";
 import { AnalyticsRow } from "../../AnalyticsRow";
 import { ChatWidthRow, FontRow, SidebarToolsLayoutRow } from "../../AppearanceSelectRows";
@@ -141,9 +142,9 @@ export function GeneralPage() {
         <SettingsRows>{window.ogb?.openAtLogin ? <OpenAtLoginRow simple /> : <InertRow title={t("settings.openAtLogin.title")} control={<Switch checked={false} tabIndex={-1} aria-label={t("settings.openAtLogin.title")} />} />}</SettingsRows>
       </SettingsGroup></AdvancedPagePart>
     )}
-    <AdvancedPagePart anchor="privacy"><SettingsGroup label={t("settings.general.privacy")} block="privacy">
+    {OPENMAUSBOT_HOSTED && <AdvancedPagePart anchor="privacy"><SettingsGroup label={t("settings.general.privacy")} block="privacy">
       <SettingsRows><AnalyticsRow simple /></SettingsRows>
-    </SettingsGroup></AdvancedPagePart>
+    </SettingsGroup></AdvancedPagePart>}
   </>;
 }
 

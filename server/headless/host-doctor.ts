@@ -8,6 +8,7 @@ import { dirname, posix, resolve } from "node:path";
 
 import { defaultDataDir, type DataHomes } from "../data-dir.ts";
 import { PRODUCTION_CLOUD_ORIGIN } from "../devs-report-send.ts";
+import { OPENMAUSBOT_HOSTED } from "../../electron/hosted-services.mjs";
 import { EXIT, flag, usageError } from "./args.ts";
 import type { VerbContext, VerbOutcome } from "./context.ts";
 
@@ -290,6 +291,7 @@ export function systemProbe(): HostProbe {
       }
     },
     async clockOffset() {
+      if (!OPENMAUSBOT_HOSTED) return null;
       try {
         const before = Date.now();
         const response = await fetch(PRODUCTION_CLOUD_ORIGIN, { method: "HEAD", redirect: "manual", signal: AbortSignal.timeout(5_000) });

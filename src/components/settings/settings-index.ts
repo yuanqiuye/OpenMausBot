@@ -4,6 +4,7 @@ import {
 } from "lucide-react";
 import type { LocaleKey } from "@/locales";
 import type { AppSettingsSection, SettingsPageId } from "@/state/store";
+import { OPENMAUSBOT_HOSTED } from "../../../electron/hosted-services.mjs";
 
 export type { SettingsPageId };
 export type SettingsOwner = "place" | "account" | "app";
@@ -95,7 +96,7 @@ export const SETTINGS_PAGES: readonly SettingsPage[] = [
   { id: "app", owner: "app", labelKey: "settings.page.app", when: () => true,
     synonyms: ["this app", "updates", "update", "version", "help", "about", "servers", "your computers", "environments", "diagnostics", "logs", "tour"] },
   { id: "general", owner: "app", labelKey: "settings.section.general", icon: SlidersHorizontal, when: advancedOnly(() => true),
-    synonyms: ["general", "language", "typing", "send", "enter", "notifications", "sounds", "startup", "login", "analytics", "privacy", "talk"] },
+    synonyms: ["general", "language", "typing", "send", "enter", "notifications", "sounds", "startup", "login", ...(OPENMAUSBOT_HOSTED ? ["analytics", "privacy"] : []), "talk"] },
   { id: "appearance", owner: "app", labelKey: "settings.section.appearance", icon: Palette, when: () => true,
     synonyms: ["appearance", "theme", "skin", "looks", "dark mode", "light mode", "font", "chat width", "layout", "threads", "pins"] },
 ];
@@ -256,7 +257,7 @@ export const SETTINGS_INDEX: readonly SettingsIndexEntry[] = [
   { id: "talk", page: "general", anchor: "typing", labelKey: "settings.search.talk", when: desk, topFor: ["voice", "microphone", "mic", "dictation", "talk"] },
   { id: "notifications", page: "general", anchor: "notifications", labelKey: "notifications.title", simple: { page: "app", anchor: "typing" }, topFor: ["notifications", "notify", "alerts", "sounds"], synonyms: ["mute", "silent", "chime", "feed"] },
   { id: "startup", page: "general", anchor: "startup", labelKey: "settings.general.startup", when: desk, synonyms: ["open at login", "startup", "launch"] },
-  { id: "analytics", page: "general", anchor: "privacy", labelKey: "settings.general.privacy", synonyms: ["analytics", "usage analytics", "privacy", "telemetry"] },
+  ...(OPENMAUSBOT_HOSTED ? [{ id: "analytics", page: "general", anchor: "privacy", labelKey: "settings.general.privacy", synonyms: ["analytics", "usage analytics", "privacy", "telemetry"] } satisfies SettingsIndexEntry] : []),
   { id: "light-dark", page: "appearance", anchor: "look", labelKey: "settings.theme.lightOrDark", topFor: ["dark mode", "night mode", "light mode"], synonyms: ["dark", "light", "system"] },
   { id: "theme", page: "appearance", anchor: "look", labelKey: "settings.theme.title", synonyms: ["skin", "looks", "themes"] },
   { id: "bubbles", page: "appearance", anchor: "look", labelKey: "settings.userBubbles.simpleTitle", synonyms: ["message color", "my messages", "bubbles"] },

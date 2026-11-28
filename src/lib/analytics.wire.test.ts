@@ -3,6 +3,7 @@
 // The real posthog-js behind a recording network stub. One flow: posthog-js is a single instance per process.
 import { gunzipSync } from "node:zlib";
 import { expect, it, vi } from "vitest";
+vi.mock("../../electron/hosted-services.mjs", async (original) => ({ ...(await original<object>()), OPENMAUSBOT_HOSTED: true }));
 
 const TOKEN = "phc_m2hP39w8y2gLPvHgDvSXAu6xcZ3agjf4ruL56rGcMZEe";
 const STORED = `ph_${TOKEN}_posthog`;

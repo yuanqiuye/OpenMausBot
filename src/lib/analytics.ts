@@ -3,6 +3,7 @@
 import type { CaptureResult, PostHog } from "posthog-js";
 import { appVersion } from "@/lib/app-links";
 import { readAdvancedMode } from "@/lib/interface-mode";
+import { OPENMAUSBOT_HOSTED } from "../../electron/hosted-services.mjs";
 
 const TOKEN = "phc_m2hP39w8y2gLPvHgDvSXAu6xcZ3agjf4ruL56rGcMZEe";
 
@@ -19,6 +20,7 @@ let pending: Array<(ph: PostHog) => void> = [];
 let choice: boolean | undefined;
 
 export function analyticsEnabled(): boolean {
+  if (!OPENMAUSBOT_HOSTED) return false;
   if (choice !== undefined) return choice;
   const desktop = desktopSwitch()?.enabled();
   if (typeof desktop === "boolean") return desktop;

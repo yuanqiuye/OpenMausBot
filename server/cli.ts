@@ -506,8 +506,8 @@ export async function runLogin(options: CliOptions, io: CliIo = defaultIo()): Pr
     io.error(`${account.credentials.file} exists but could not be read; fix or remove it, then try again`);
     return 1;
   }
-  if (!account.controlPlane) {
-    io.error("OMB_CONTROL_PLANE_URL is set but is not an https address");
+  if (account.controlPlaneMissing) {
+    io.error(account.controlPlaneMissing);
     return 1;
   }
   const existing = describeTunnelAccount(account.credentials.read());

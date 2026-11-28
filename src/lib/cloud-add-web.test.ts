@@ -30,15 +30,23 @@ describe("Add a Cloud without the desktop's own sign-in", () => {
   it("opens a new tab in a browser, through main on a desktop, and counts the hop", () => {
     const open = vi.fn();
     vi.stubGlobal("window", { open });
-    openCloudOnWeb({ source: "app_onboarding" }, away);
+    openCloudOnWeb({ source: "app_onboarding" }, away, true);
     expect(open).toHaveBeenCalledExactlyOnceWith("https://cloud.openmausbot.com/pro/buy?src=app_onboarding", "_blank", "noopener,noreferrer");
     expect(track).toHaveBeenCalledExactlyOnceWith("cloud_checkout_opened", { plan: "pro", source: "app_onboarding", via: "web" });
     const openExternal = vi.fn(async () => {});
     vi.stubGlobal("window", { open, ogb: { openExternal, remoteClient: { active: true } } });
-    openCloudOnWeb({ source: "app_card" }, { cloudHome: true });
+    openCloudOnWeb({ source: "app_card" }, { cloudHome: true }, true);
     expect(openExternal).toHaveBeenCalledExactlyOnceWith("https://cloud.openmausbot.com/cloud?src=app_card");
     expect(open).toHaveBeenCalledTimes(1);
     expect(track).toHaveBeenLastCalledWith("cloud_checkout_opened", { source: "app_card", via: "cloud_page" });
+  });
+
+  it("opens nothing and counts nothing where this build offers no Cloud", () => {
+    const open = vi.fn();
+    vi.stubGlobal("window", { open });
+    openCloudOnWeb({ source: "app_onboarding" }, away);
+    expect(open).not.toHaveBeenCalled();
+    expect(track).not.toHaveBeenCalled();
   });
 
   it("only the desktop's own page has the sign-in Add a Cloud runs on", () => {

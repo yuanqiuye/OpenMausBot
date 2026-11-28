@@ -148,6 +148,9 @@ if (isLocalPage && !desktopRemoteClient && process.argv.includes("--omb-company-
   });
 }
 
+const companyDesktop = process.argv.includes("--omb-company-desktop=1");
+const hostedServices = companyDesktop && process.argv.includes("--omb-hosted-services=1");
+
 // main passes app.getVersion(): a server's page carries that server's version, so About asks this for the app's own.
 const appVersion = (process.argv.find((arg) => arg.startsWith("--omb-app-version="))?.slice("--omb-app-version=".length) ?? "").slice(0, 64);
 
@@ -548,7 +551,7 @@ const bridge = {
       return () => ipcRenderer.removeListener("workspaces:open-settings", handler);
     },
   },
-  cloudAccount: process.argv.includes("--omb-company-desktop=1") ? {
+  cloudAccount: hostedServices ? {
     state: () => ipcRenderer.invoke("cloud-account:state"),
     begin: () => ipcRenderer.invoke("cloud-account:begin"),
     signInAgain: () => ipcRenderer.invoke("cloud-account:signInAgain"),
@@ -601,7 +604,7 @@ const bridge = {
     },
   } : undefined,
   // Either page: the one-time move's line.
-  cloudSendPage: process.argv.includes("--omb-company-desktop=1") ? {
+  cloudSendPage: hostedServices ? {
     notice: () => ipcRenderer.invoke("cloud-send:notice"),
     dismiss: signature => ipcRenderer.invoke("cloud-send:dismiss", String(signature)),
     moveRetry: () => isLocalPage || navigator.userActivation?.isActive === true
@@ -643,7 +646,7 @@ const bridge = {
     },
   } : undefined,
   // This computer's page and My Cloud's own page (main refuses any other): the other one's bots, listed beside this one's.
-  placesTogether: process.argv.includes("--omb-company-desktop=1") ? {
+  placesTogether: hostedServices ? {
     state: () => ipcRenderer.invoke("places-together:state"),
     set: (on, from) => isLocalPage || navigator.userActivation?.isActive === true
       ? ipcRenderer.invoke("places-together:set", on === true, ...(from === "notice" ? ["notice"] : [])) : Promise.reject(new Error("Turn the switch to list both places' bots.")),
@@ -686,7 +689,7 @@ const bridge = {
     },
   },
   // Who is signed in on this device: this app's own pages only (main checks the sender). No token ever comes through here.
-  accounts: process.argv.includes("--omb-company-desktop=1") ? {
+  accounts: hostedServices ? {
     list: () => ipcRenderer.invoke("accounts:list"),
     signOut: id => ipcRenderer.invoke("accounts:sign-out", String(id)),
     addStart: email => ipcRenderer.invoke("accounts:add-start", String(email)),
@@ -709,12 +712,12 @@ const bridge = {
     },
   } : undefined,
   // Any place's page: opens the accounts sheet on the rail's page, from the person's click. The page learns nothing of them.
-  accountSheet: process.argv.includes("--omb-company-desktop=1") ? {
+  accountSheet: hostedServices ? {
     offered: () => ipcRenderer.invoke("accounts:offered"),
     open: () => isLocalPage || navigator.userActivation?.isActive === true
       ? ipcRenderer.invoke("accounts:open") : Promise.reject(new Error("Choose your account to open it.")),
   } : undefined,
-  cloudPlan: process.argv.includes("--omb-company-desktop=1") ? {
+  cloudPlan: hostedServices ? {
     state: () => ipcRenderer.invoke("cloud-plan:state"),
     manage: () => isLocalPage || navigator.userActivation?.isActive === true
       ? ipcRenderer.invoke("cloud-plan:manage") : Promise.reject(new Error("Choose Manage to open your Plan page.")),
@@ -737,7 +740,7 @@ const bridge = {
     restartNow: () => navigator.userActivation?.isActive === true
       ? ipcRenderer.invoke("cloud-plan:restart-now") : Promise.reject(new Error("Choose Restart now to restart the Cloud.")),
   } : undefined,
-  organization: process.argv.includes("--omb-company-desktop=1") ? {
+  organization: hostedServices ? {
     settingsOpened: () => ipcRenderer.invoke("organization:settings-opened"),
     state: () => ipcRenderer.invoke("organization:state"),
     begin: input => ipcRenderer.invoke("organization:begin", input),
@@ -751,7 +754,7 @@ const bridge = {
       return () => ipcRenderer.removeListener("organization:state-changed", handler);
     },
   } : undefined,
-  companyBackups: process.argv.includes("--omb-company-desktop=1") ? {
+  companyBackups: companyDesktop ? {
     state: () => ipcRenderer.invoke("company-backups:state"),
     list: () => ipcRenderer.invoke("company-backups:list"),
     create: input => ipcRenderer.invoke("company-backups:create", input),
